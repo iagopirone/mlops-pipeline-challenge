@@ -1,0 +1,14 @@
+# dataset derivado (gerado por prep_data.py)
+/dataset/
+# saídas de treino do ultralytics
+/runs/
+# checkpoint base baixado
+/yolo11n.pt
+# logs
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/

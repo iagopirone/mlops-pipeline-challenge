@@ -1,0 +1,21 @@
+[project]
+name = "mlops-pipeline-challenge"
+version = "0.1.0"
+description = "Starter kit — desafio de pipeline de MLOps (detector BCCD)"
+requires-python = ">=3.12"
+
+# Inferência (leve — sem torch)
+dependencies = [
+    "onnxruntime>=1.17.0",
+    "opencv-python>=4.9.0",
+    "numpy>=1.26.0",
+]
+
+[dependency-groups]
+# Treino offline (puxa torch via ultralytics) — necessário só para src/train.py
+train = [
+    "ultralytics>=8.3.0",
+]
+
+[tool.uv]
+default-groups = []
