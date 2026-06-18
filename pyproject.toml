@@ -9,6 +9,7 @@ dependencies = [
     "onnxruntime>=1.17.0",
     "opencv-python>=4.9.0",
     "numpy>=1.26.0",
+    "pika>=1.4.1",
 ]
 
 [dependency-groups]
