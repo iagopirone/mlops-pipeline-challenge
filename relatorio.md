@@ -457,7 +457,7 @@ q.infer.result → Collect Worker fake → q.label.task + q.data.build
 
 Com isso, consegui simular o loop principal do pipeline: uma mensagem gera a próxima etapa, e o Collect Worker fake consegue simular uma coleta por baixa confiança, criar uma tarefa de anotação e disparar um novo ciclo de dados.
 
-Além dos workers fake, também fiz os testes sugeridos pelo Fernando para entender melhor o funcionamento básico de um publisher e de um consumer.
+Além dos workers fake, também fiz os testes sugeridos a partir do feedback técnico recebido para entender melhor o funcionamento básico de um publisher e de um consumer.
 
 Criei uma fila simples chamada:
 
