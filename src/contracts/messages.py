@@ -73,3 +73,16 @@ class InferResultEvent(BaseModel):
     ts: str
     detections: list[Detection]
     source_event: dict[str, Any]
+
+class LabelTaskEvent(BaseModel):
+    event: Literal["label.task"] = "label.task"
+    label_task_id: str
+    reason: Literal["low_confidence"] = "low_confidence"
+    inference_id: str
+    image_uri: str
+    model_version: str
+    min_conf: float = Field(ge=0.0, le=1.0)
+    threshold: float = Field(ge=0.0, le=1.0)
+    status: Literal["pending_annotation"] = "pending_annotation"
+    created_at: str
+    source_event: dict[str, Any]
