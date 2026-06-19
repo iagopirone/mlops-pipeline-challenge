@@ -49,3 +49,27 @@ class ModelPromotedEvent(BaseModel):
     promoted: Literal[True] = True
     created_at: str
     source_event: dict[str, Any]
+
+class InferRequestEvent(BaseModel):
+    event: Literal["infer.request"]
+    image_uri: str
+    model_version: str = "production"
+
+
+class Detection(BaseModel):
+    cls: str
+    conf: float = Field(ge=0.0, le=1.0)
+    box: list[float] = Field(min_length=4, max_length=4)
+
+
+class InferResultEvent(BaseModel):
+    event: Literal["infer.result"] = "infer.result"
+    inference_id: str
+    model_version: str
+    status: Literal["success", "error"] = "success"
+    image_uri: str
+    latency_ms: float = Field(ge=0.0)
+    min_conf: float = Field(ge=0.0, le=1.0)
+    ts: str
+    detections: list[Detection]
+    source_event: dict[str, Any]
