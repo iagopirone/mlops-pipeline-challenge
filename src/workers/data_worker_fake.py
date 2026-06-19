@@ -1,12 +1,31 @@
-﻿import json
+﻿import sys
 from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 import pika
 
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+
+from src.messaging.rabbitmq import (  # noqa: E402
+    create_connection,
+    declare_queues,
+    parse_json_body,
+    publish_json,
+)
+
+
+DATA_BUILD_QUEUE = "q.data.build"
+TRAIN_RUN_QUEUE = "q.train.run"
+
 QUEUES = [
-    "q.data.build",
-    "q.train.run",
+    DATA_BUILD_QUEUE,
+    TRAIN_RUN_QUEUE,
     "q.model.promoted",
     "q.infer.request",
     "q.infer.result",
@@ -14,19 +33,20 @@ QUEUES = [
 ]
 
 
-def declare_queues(channel) -> None:
-    for queue in QUEUES:
-        channel.queue_declare(queue=queue, durable=True)
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def on_message(channel, method, properties, body) -> None:
-    print("\n[data_worker] mensagem recebida de q.data.build:")
-    print(body.decode("utf-8"))
+def build_fake_train_event(source_event: dict) -> dict:
+    """
+    Builds a fake train.run event.
 
-    message = json.loads(body)
-
-    train_event = {
+    This simulates the output that the real Data Worker will produce later
+    after creating a versioned dataset.
+    """
+    return {
         "event": "train.run",
+        "run_request_id": f"train-{uuid4().hex[:8]}",
         "dataset_version": "ds-001",
         "dataset_uri": "storage/datasets/ds-001",
         "classes": ["RBC", "WBC", "Platelets"],
@@ -36,51 +56,61 @@ def on_message(channel, method, properties, body) -> None:
             "test": 0,
         },
         "added_this_cycle": 0,
-        "source_event": message,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": utc_now(),
+        "source_event": source_event,
     }
 
-    channel.basic_publish(
-        exchange="",
-        routing_key="q.train.run",
-        body=json.dumps(train_event).encode("utf-8"),
-        properties=pika.BasicProperties(
-            delivery_mode=2,
-            content_type="application/json",
-        ),
-    )
 
-    channel.basic_ack(delivery_tag=method.delivery_tag)
+def on_message(channel, method, properties, body) -> None:
+    print("\n[Data Worker Fake] Received data build request")
 
-    print("[data_worker] mensagem publicada em q.train.run:")
-    print(json.dumps(train_event, indent=2))
+    try:
+        message = parse_json_body(body)
+
+        print("[Data Worker Fake] Input event:")
+        print(message)
+
+        train_event = build_fake_train_event(message)
+
+        publish_json(
+            channel=channel,
+            queue=TRAIN_RUN_QUEUE,
+            message=train_event,
+        )
+
+        print(f"[Data Worker Fake] Published fake train event to {TRAIN_RUN_QUEUE}")
+
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+        print("[Data Worker Fake] Message acknowledged")
+
+    except Exception as error:
+        print(f"[Data Worker Fake] Error while processing message: {error}")
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 
 def main() -> None:
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host="localhost")
-    )
+    connection = create_connection()
     channel = connection.channel()
 
-    declare_queues(channel)
+    declare_queues(channel, QUEUES)
 
     channel.basic_qos(prefetch_count=1)
+
     channel.basic_consume(
-        queue="q.data.build",
+        queue=DATA_BUILD_QUEUE,
         on_message_callback=on_message,
         auto_ack=False,
     )
 
-    print("[data_worker] aguardando mensagens em q.data.build...")
-    print("[data_worker] pressione CTRL+C para parar.")
+    print(f"[Data Worker Fake] Waiting for messages from {DATA_BUILD_QUEUE}")
+    print("[Data Worker Fake] Press CTRL+C to stop")
 
     try:
         channel.start_consuming()
     except KeyboardInterrupt:
-        print("\n[data_worker] encerrando...")
-        channel.stop_consuming()
-
-    connection.close()
+        print("\n[Data Worker Fake] Stopping...")
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":
