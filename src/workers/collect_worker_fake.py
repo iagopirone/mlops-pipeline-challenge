@@ -1,118 +1,134 @@
 ﻿import json
 from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 import pika
 
 
-QUEUES = [
-    "q.data.build",
-    "q.train.run",
-    "q.model.promoted",
-    "q.infer.request",
-    "q.infer.result",
-    "q.label.task",
-]
+RABBITMQ_HOST = "localhost"
 
+INFER_RESULT_QUEUE = "q.infer.result"
+LABEL_TASK_QUEUE = "q.label.task"
+
+QUEUES = [
+    INFER_RESULT_QUEUE,
+    LABEL_TASK_QUEUE,
+]
 
 LOW_CONF_THRESHOLD = 0.50
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+CANDIDATES_DIR = ROOT_DIR / "storage" / "label_candidates"
+CANDIDATES_FILE = CANDIDATES_DIR / "candidates.jsonl"
 
-def declare_queues(channel) -> None:
-    for queue in QUEUES:
-        channel.queue_declare(queue=queue, durable=True)
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def save_candidate(label_task: dict) -> None:
+    """
+    Saves selected low-confidence cases locally.
+
+    This simulates accumulating candidates before rebuilding the dataset.
+    The dataset rebuild should not happen for every single low-confidence case.
+    """
+    CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
+
+    with CANDIDATES_FILE.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(label_task) + "\n")
+
+
+def publish_json(channel, queue: str, message: dict) -> None:
+    channel.basic_publish(
+        exchange="",
+        routing_key=queue,
+        body=json.dumps(message).encode("utf-8"),
+        properties=pika.BasicProperties(
+            delivery_mode=2,
+            content_type="application/json",
+        ),
+    )
 
 
 def on_message(channel, method, properties, body) -> None:
-    print("\n[collect_worker] mensagem recebida de q.infer.result:")
-    print(body.decode("utf-8"))
+    print("\n[Collect Worker Fake] Received inference result")
 
-    message = json.loads(body)
+    try:
+        message = json.loads(body.decode("utf-8"))
 
-    min_conf = message.get("min_conf", 1.0)
-    should_collect = min_conf < LOW_CONF_THRESHOLD
+        inference_id = message.get("inference_id")
+        image_uri = message.get("image_uri")
+        model_version = message.get("model_version")
+        min_conf = float(message.get("min_conf", 1.0))
 
-    if should_collect:
-        label_task_event = {
-            "event": "label.task",
-            "inference_id": message["inference_id"],
-            "image_uri": message["image_uri"],
-            "reason": "low_confidence",
-            "min_conf": min_conf,
-            "threshold": LOW_CONF_THRESHOLD,
-            "annotation_source": "oracle_simulado",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        print(f"[Collect Worker Fake] inference_id={inference_id}")
+        print(f"[Collect Worker Fake] image_uri={image_uri}")
+        print(f"[Collect Worker Fake] model_version={model_version}")
+        print(f"[Collect Worker Fake] min_conf={min_conf}")
 
-        data_build_event = {
-            "event": "data.build",
-            "trigger": "feedback",
-            "raw_uri": "data/raw",
-            "params": {
-                "val_frac": 0.15,
-                "test_frac": 0.15
-            },
-            "source_inference_id": message["inference_id"],
-            "reason": "new_labeled_sample_from_feedback",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        should_collect = min_conf < LOW_CONF_THRESHOLD
 
-        channel.basic_publish(
-            exchange="",
-            routing_key="q.label.task",
-            body=json.dumps(label_task_event).encode("utf-8"),
-            properties=pika.BasicProperties(
-                delivery_mode=2,
-                content_type="application/json",
-            ),
-        )
+        if should_collect:
+            label_task = {
+                "event": "label.task",
+                "label_task_id": f"label-{uuid4().hex[:8]}",
+                "reason": "low_confidence",
+                "inference_id": inference_id,
+                "image_uri": image_uri,
+                "model_version": model_version,
+                "min_conf": min_conf,
+                "threshold": LOW_CONF_THRESHOLD,
+                "status": "pending_annotation",
+                "created_at": utc_now(),
+                "source_event": message,
+            }
 
-        channel.basic_publish(
-            exchange="",
-            routing_key="q.data.build",
-            body=json.dumps(data_build_event).encode("utf-8"),
-            properties=pika.BasicProperties(
-                delivery_mode=2,
-                content_type="application/json",
-            ),
-        )
+            publish_json(channel, LABEL_TASK_QUEUE, label_task)
+            save_candidate(label_task)
 
-        print("[collect_worker] caso selecionado para anotação por baixa confiança.")
-        print("[collect_worker] mensagem publicada em q.label.task:")
-        print(json.dumps(label_task_event, indent=2))
-        print("[collect_worker] mensagem publicada em q.data.build:")
-        print(json.dumps(data_build_event, indent=2))
+            print("[Collect Worker Fake] Low-confidence case selected")
+            print(f"[Collect Worker Fake] Published label task to {LABEL_TASK_QUEUE}")
+            print(f"[Collect Worker Fake] Saved candidate to {CANDIDATES_FILE}")
+            print("[Collect Worker Fake] Dataset rebuild was NOT triggered automatically")
+        else:
+            print("[Collect Worker Fake] Confidence is high enough; no label task created")
 
-    else:
-        print("[collect_worker] caso não selecionado para coleta. Confiança suficiente.")
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+        print("[Collect Worker Fake] Message acknowledged")
 
-    channel.basic_ack(delivery_tag=method.delivery_tag)
+    except Exception as error:
+        print(f"[Collect Worker Fake] Error while processing message: {error}")
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 
 def main() -> None:
     connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host="localhost")
+        pika.ConnectionParameters(host=RABBITMQ_HOST)
     )
     channel = connection.channel()
 
-    declare_queues(channel)
+    for queue in QUEUES:
+        channel.queue_declare(queue=queue, durable=True)
 
     channel.basic_qos(prefetch_count=1)
+
     channel.basic_consume(
-        queue="q.infer.result",
+        queue=INFER_RESULT_QUEUE,
         on_message_callback=on_message,
         auto_ack=False,
     )
 
-    print("[collect_worker] aguardando mensagens em q.infer.result...")
-    print("[collect_worker] pressione CTRL+C para parar.")
+    print(f"[Collect Worker Fake] Waiting for messages from {INFER_RESULT_QUEUE}")
+    print("[Collect Worker Fake] Press CTRL+C to stop")
 
     try:
         channel.start_consuming()
     except KeyboardInterrupt:
-        print("\n[collect_worker] encerrando...")
-        channel.stop_consuming()
-
-    connection.close()
+        print("\n[Collect Worker Fake] Stopping...")
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":
