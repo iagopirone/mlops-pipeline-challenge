@@ -32,3 +32,20 @@ class TrainRunEvent(BaseModel):
     added_this_cycle: int = 0
     created_at: str
     source_event: dict[str, Any]
+
+class ModelMetrics(BaseModel):
+    mAP50: float = Field(ge=0.0, le=1.0)
+    per_class: dict[str, float] = Field(default_factory=dict)
+
+
+class ModelPromotedEvent(BaseModel):
+    event: Literal["model.promoted"] = "model.promoted"
+    model_version: str
+    base_model: str
+    model_uri: str
+    dataset_version: str
+    metrics: ModelMetrics
+    baseline: float = Field(ge=0.0, le=1.0)
+    promoted: Literal[True] = True
+    created_at: str
+    source_event: dict[str, Any]
