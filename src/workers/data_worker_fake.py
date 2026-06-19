@@ -4,6 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pika
+from pydantic import ValidationError
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -12,6 +13,11 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 
+from src.contracts.messages import (  # noqa: E402
+    DataBuildMessage,
+    DatasetCounts,
+    TrainRunEvent,
+)
 from src.messaging.rabbitmq import (  # noqa: E402
     create_connection,
     declare_queues,
@@ -37,51 +43,62 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_fake_train_event(source_event: dict) -> dict:
+def build_fake_train_event(data_build_message: DataBuildMessage) -> TrainRunEvent:
     """
     Builds a fake train.run event.
 
     This simulates the output that the real Data Worker will produce later
     after creating a versioned dataset.
     """
-    return {
-        "event": "train.run",
-        "run_request_id": f"train-{uuid4().hex[:8]}",
-        "dataset_version": "ds-001",
-        "dataset_uri": "storage/datasets/ds-001",
-        "classes": ["RBC", "WBC", "Platelets"],
-        "counts": {
-            "train": 0,
-            "val": 0,
-            "test": 0,
-        },
-        "added_this_cycle": 0,
-        "created_at": utc_now(),
-        "source_event": source_event,
-    }
+    return TrainRunEvent(
+        run_request_id=f"train-{uuid4().hex[:8]}",
+        dataset_version="ds-001",
+        dataset_uri="storage/datasets/ds-001",
+        classes=["RBC", "WBC", "Platelets"],
+        counts=DatasetCounts(
+            train=0,
+            val=0,
+            test=0,
+        ),
+        added_this_cycle=0,
+        created_at=utc_now(),
+        source_event=data_build_message.model_dump(mode="json"),
+    )
 
 
 def on_message(channel, method, properties, body) -> None:
     print("\n[Data Worker Fake] Received data build request")
 
     try:
-        message = parse_json_body(body)
+        raw_message = parse_json_body(body)
+        data_build_message = DataBuildMessage.model_validate(raw_message)
 
-        print("[Data Worker Fake] Input event:")
-        print(message)
+        print("[Data Worker Fake] Validated input event:")
+        print(data_build_message.model_dump(mode="json"))
 
-        train_event = build_fake_train_event(message)
+        print("[Data Worker Fake] Extracted parameters:")
+        print(f"  raw_uri={data_build_message.raw_uri}")
+        print(f"  val_frac={data_build_message.params.val_frac}")
+        print(f"  test_frac={data_build_message.params.test_frac}")
+        print(f"  seed={data_build_message.params.seed}")
+
+        train_event = build_fake_train_event(data_build_message)
 
         publish_json(
             channel=channel,
             queue=TRAIN_RUN_QUEUE,
-            message=train_event,
+            message=train_event.model_dump(mode="json"),
         )
 
         print(f"[Data Worker Fake] Published fake train event to {TRAIN_RUN_QUEUE}")
 
         channel.basic_ack(delivery_tag=method.delivery_tag)
         print("[Data Worker Fake] Message acknowledged")
+
+    except ValidationError as error:
+        print("[Data Worker Fake] Invalid data.build message")
+        print(error)
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
     except Exception as error:
         print(f"[Data Worker Fake] Error while processing message: {error}")
