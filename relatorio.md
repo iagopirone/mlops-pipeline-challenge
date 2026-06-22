@@ -554,3 +554,246 @@ O próximo passo é começar a substituir o Data Worker fake por um Data Worker 
 Esse worker deverá consumir mensagens da fila `q.data.build`, converter a mensagem JSON em dicionário Python, extrair parâmetros como `raw_uri`, `val_frac`, `test_frac` e `seed`, executar a lógica de preparação de dados, criar uma versão de dataset como `ds-001`, salvar metadados dessa versão e publicar um evento real em `q.train.run`.
 
 Depois disso, o próximo avanço será transformar o Train Worker fake em um Train Worker real, usando o script de treino, registrando métricas e aplicando o gate de qualidade.
+
+
+### 19/06/2026 — Padronização dos workers e início dos workers reais
+
+#### O que fiz
+
+Nesta etapa, incorporei os feedbacks recebidos na daily anterior e comecei a substituir partes do pipeline fake por workers reais.
+
+Primeiro, ajustei a lógica do `Collect Worker fake`. Na versão anterior, quando uma inferência tinha baixa confiança, o worker publicava automaticamente uma nova mensagem em `q.data.build`, iniciando um novo ciclo de construção de dataset. Depois do feedback técnico recebido, alterei esse comportamento.
+
+Agora, o `collect_worker_fake.py` apenas registra o caso como candidato para anotação e publica uma mensagem em:
+
+```text
+q.label.task
+```
+
+O worker também salva localmente o candidato em:
+
+```text
+storage/label_candidates/candidates.jsonl
+```
+
+Com isso, o rebuild do dataset não acontece mais automaticamente a cada baixa confiança. A reconstrução do dataset passa a ser uma etapa posterior, manual ou em lote, o que torna o fluxo mais realista.
+
+Depois disso, implementei a sugestão de modularizar a parte repetida do RabbitMQ. Criei um módulo comum chamado:
+
+```text
+src/messaging/rabbitmq.py
+```
+
+Esse módulo centraliza funções usadas por vários workers, como:
+
+```text
+create_connection
+declare_queues
+publish_json
+parse_json_body
+```
+
+Com isso, os workers não precisam mais repetir a lógica de conexão com RabbitMQ, declaração de filas, publicação de mensagens JSON e conversão do corpo da mensagem recebida.
+
+Também implementei contratos de mensagens usando Pydantic no arquivo:
+
+```text
+src/contracts/messages.py
+```
+
+A ideia foi deixar de trabalhar apenas com dicionários soltos e passar a validar as mensagens recebidas pelos workers. Foram criados contratos para os principais eventos do pipeline, como:
+
+```text
+DataBuildMessage
+TrainRunEvent
+ModelPromotedEvent
+InferRequestEvent
+InferResultEvent
+LabelTaskEvent
+```
+
+A partir disso, os workers passaram a validar as mensagens na entrada. Por exemplo, no Data Worker, a mensagem recebida é convertida de JSON para dicionário e depois validada com:
+
+```python
+data_build_message = DataBuildMessage.model_validate(raw_message)
+```
+
+Depois de criar o helper comum de RabbitMQ e os contratos Pydantic, refatorei todos os workers fake para seguirem esse mesmo padrão:
+
+```text
+data_worker_fake.py
+train_worker_fake.py
+infer_worker_fake.py
+collect_worker_fake.py
+```
+
+Com isso, todos os workers fake passaram a ter uma estrutura mais consistente:
+
+```text
+mensagem RabbitMQ
+→ parse_json_body
+→ validação com Pydantic
+→ execução da lógica do worker
+→ publicação do próximo evento com publish_json
+→ ack
+```
+
+Depois de padronizar os workers fake, comecei a implementar os workers reais.
+
+O primeiro foi o:
+
+```text
+src/workers/data_worker_real.py
+```
+
+Esse worker consome mensagens da fila:
+
+```text
+q.data.build
+```
+
+Em seguida, valida a mensagem com `DataBuildMessage`, extrai parâmetros como `raw_uri`, `val_frac`, `test_frac` e `seed`, executa o `prep_data.py` e cria um dataset versionado dentro de:
+
+```text
+storage/datasets/
+```
+
+No teste realizado, o worker criou corretamente uma versão de dataset e gerou os splits:
+
+```text
+train=63
+val=14
+test=14
+```
+
+Depois disso, o `data_worker_real.py` publicou um evento real em:
+
+```text
+q.train.run
+```
+
+Em seguida, implementei o:
+
+```text
+src/workers/train_worker_real.py
+```
+
+Esse worker consome mensagens da fila:
+
+```text
+q.train.run
+```
+
+Ele valida o evento com `TrainRunEvent`, executa o `train.py`, captura a métrica de avaliação `TEST mAP50`, compara com o baseline definido e aplica o gate de qualidade.
+
+Durante o teste, apareceu um problema de encoding no Windows ao capturar o output do `train.py` com `subprocess.run`. O erro acontecia porque o terminal tentava decodificar alguns caracteres usando a codificação padrão do Windows. Para corrigir isso, ajustei o `subprocess.run` usando:
+
+```python
+encoding="utf-8"
+errors="replace"
+```
+
+Depois dessa correção, o `train_worker_real.py` conseguiu executar o treino real, exportar o modelo em ONNX, extrair a métrica e aplicar o gate de qualidade.
+
+No teste final, o modelo obteve:
+
+```text
+TEST mAP50=0.8208
+Baseline mAP50=0.5000
+```
+
+Como a métrica ficou acima do baseline, o modelo passou no gate de qualidade. O worker registrou os artefatos do modelo em:
+
+```text
+storage/models/
+```
+
+e publicou o evento de promoção em:
+
+```text
+q.model.promoted
+```
+
+Também validei o fluxo integrado entre os dois workers reais já implementados:
+
+```text
+q.data.build → Data Worker real → q.train.run → Train Worker real → q.model.promoted
+```
+
+Esse teste mostrou que o pipeline já consegue sair de uma mensagem de construção de dataset, criar um dataset versionado, iniciar um treino real, aplicar o gate de qualidade e promover um modelo aprovado.
+
+#### O que aprendi
+
+Aprendi melhor a importância de separar a lógica de infraestrutura da lógica de negócio dos workers.
+
+Antes, cada worker tinha sua própria lógica para conectar no RabbitMQ, declarar filas, publicar mensagens e converter o corpo da mensagem. Isso funcionava, mas criava repetição e deixava o código mais difícil de manter.
+
+Com o helper comum em `src/messaging/rabbitmq.py`, os workers ficaram mais simples. Cada worker agora se concentra mais na sua própria responsabilidade:
+
+* o Data Worker prepara e versiona datasets;
+* o Train Worker treina, avalia e aplica o gate de qualidade;
+* o Infer Worker simula ou executa inferência;
+* o Collect Worker seleciona casos para anotação.
+
+Também aprendi melhor o papel do Pydantic em um sistema orientado a mensagens. Em vez de confiar que todo dicionário recebido terá o formato correto, agora o worker valida explicitamente o contrato da mensagem antes de processá-la.
+
+Isso ajuda a evitar erros silenciosos. Por exemplo, se uma mensagem `data.build` vier sem `raw_uri` ou com `val_frac` inválido, o erro aparece logo na entrada do worker, antes de executar qualquer lógica mais pesada.
+
+Outro aprendizado importante foi sobre o gate de qualidade. O modelo treinado pode ser considerado uma run válida mesmo que não seja promovido. A promoção só acontece se a métrica superar o baseline definido. Isso separa duas ideias diferentes:
+
+```text
+treinar um modelo
+promover um modelo para produção
+```
+
+Também entendi melhor como manter rastreabilidade entre dataset e modelo. O evento `train.run` carrega a versão do dataset, e o evento `model.promoted` mantém referência ao `dataset_version`. Assim, é possível saber qual dataset foi usado para gerar determinado modelo.
+
+Além disso, aprendi que, ao rodar subprocessos no Windows, pode ser necessário controlar explicitamente a codificação do output, principalmente quando bibliotecas externas imprimem caracteres que não são compatíveis com a codificação padrão do terminal.
+
+#### Decisões tomadas
+
+Decidi não partir diretamente para todos os workers reais antes de padronizar os workers fake.
+
+A razão foi reduzir risco. Antes de integrar `prep_data.py`, `train.py` e futuramente `infer.py` dentro dos workers reais, considerei melhor garantir que a arquitetura fake já estivesse organizada com:
+
+```text
+helper comum de RabbitMQ
+contratos Pydantic
+validação de mensagens
+ack/nack
+publicação padronizada de eventos
+```
+
+Também decidi manter os workers fake no projeto. Eles continuam úteis para testes rápidos da mensageria, sem precisar rodar tarefas mais pesadas como treino de modelo.
+
+Outra decisão foi criar os workers reais de forma incremental. Primeiro implementei o `data_worker_real.py`, depois o `train_worker_real.py`. Isso permitiu testar o fluxo por partes e identificar problemas mais facilmente.
+
+Também decidi manter o gate de qualidade no Train Worker real. O worker só publica `q.model.promoted` se o modelo passar no critério mínimo definido. Caso contrário, o treino ainda seria uma run válida, mas sem promoção do modelo.
+
+Por fim, decidi manter o `q.data.build` fora do disparo automático do Collect Worker. O Collect Worker agora apenas cria tarefas de anotação e salva candidatos. A reconstrução do dataset deverá acontecer em uma etapa posterior, quando houver dados anotados suficientes.
+
+Com isso, considero a Entrega 2 concluída. A etapa atual já demonstra a evolução do pipeline de um esqueleto fake de mensageria para uma estrutura mais organizada, com contratos de mensagens, helper comum de RabbitMQ e workers reais para dados e treino.
+
+#### Próximo passo
+
+O próximo passo será iniciar a Entrega 3.
+
+A prioridade será implementar o `Inference Worker real`, conectando o modelo promovido ao fluxo real de inferência. Esse worker deverá consumir mensagens de:
+
+```text
+q.infer.request
+```
+
+executar inferência com o modelo ONNX ativo e publicar os resultados em:
+
+```text
+q.infer.result
+```
+
+Depois disso, o próximo avanço será transformar o fluxo de coleta em uma etapa mais real, conectando os resultados de inferência ao processo de seleção de exemplos de baixa confiança e preparação para anotação.
+
+Com isso, o objetivo será fechar melhor o ciclo:
+
+```text
+dados → treino → promoção → inferência → coleta → anotação → novos dados
+```
