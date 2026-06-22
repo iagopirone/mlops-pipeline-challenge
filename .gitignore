@@ -14,3 +14,6 @@ __pycache__/
 .ipynb_checkpoints/
 
 storage/
+
+data/raw/images/oracle_*
+data/raw/labels/oracle_*
