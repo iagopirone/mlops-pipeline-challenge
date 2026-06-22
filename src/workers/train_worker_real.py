@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 import subprocess
@@ -33,6 +34,7 @@ MODEL_PROMOTED_QUEUE = "q.model.promoted"
 
 BASE_MODEL = "models/v0/best.pt"
 BASELINE_MAP50 = 0.50
+PRODUCTION_POINTER_FILE = ROOT_DIR / "storage" / "models" / "production.json"
 
 EPOCHS = 1
 IMGSZ = 640
@@ -194,6 +196,33 @@ def build_model_promoted_event(
         source_event=train_run_event.model_dump(mode="json"),
     )
 
+def update_production_pointer(model_promoted_event: ModelPromotedEvent) -> None:
+    """
+    Updates the production model pointer.
+
+    The inference worker does not need to consume q.model.promoted directly.
+    Instead, it reads this file and reloads the model when it changes.
+    """
+    PRODUCTION_POINTER_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    pointer = {
+        "model_version": model_promoted_event.model_version,
+        "model_uri": model_promoted_event.model_uri,
+        "dataset_version": model_promoted_event.dataset_version,
+        "metrics": model_promoted_event.metrics.model_dump(mode="json"),
+        "baseline": model_promoted_event.baseline,
+        "updated_at": utc_now(),
+    }
+
+    temp_file = PRODUCTION_POINTER_FILE.with_suffix(".tmp")
+    temp_file.write_text(
+        json.dumps(pointer, indent=2),
+        encoding="utf-8",
+    )
+    temp_file.replace(PRODUCTION_POINTER_FILE)
+
+    print(f"[Train Worker Real] Updated production pointer at {PRODUCTION_POINTER_FILE}")
+
 
 def on_message(channel, method, properties, body) -> None:
     print("\n[Train Worker Real] Received train request")
@@ -233,7 +262,10 @@ def on_message(channel, method, properties, body) -> None:
             model_version=model_version,
             model_dir=model_dir,
             map50=map50,
+            
         )
+
+        update_production_pointer(model_promoted_event)
 
         publish_json(
             channel=channel,
