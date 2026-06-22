@@ -797,3 +797,565 @@ Com isso, o objetivo será fechar melhor o ciclo:
 ```text
 dados → treino → promoção → inferência → coleta → anotação → novos dados
 ```
+
+### 22/06/2026 — Fechamento do ciclo real de inferência, coleta, anotação simulada e rastreabilidade
+
+#### O que fiz
+
+Nesta etapa, avancei na Entrega 3 com o objetivo de fechar o ciclo real do pipeline de MLOps depois da promoção do modelo.
+
+Na etapa anterior, o pipeline já possuía os workers reais de dados e treino funcionando:
+
+```text
+q.data.build
+→ Data Worker real
+→ q.train.run
+→ Train Worker real
+→ q.model.promoted
+```
+
+Hoje, a prioridade foi completar o restante do loop:
+
+```text
+modelo promovido
+→ inferência
+→ coleta de baixa confiança
+→ anotação simulada
+→ reincorporação em data/raw
+→ novo ciclo de dados
+```
+
+Primeiro, ajustei o fluxo de promoção de modelo para deixar explícito qual modelo está em produção. Para isso, o `Train Worker real` passou a atualizar um ponteiro local de produção em:
+
+```text
+storage/models/production.json
+```
+
+Esse arquivo guarda informações como:
+
+```text
+model_version
+model_uri
+dataset_version
+metrics
+baseline
+base_model
+updated_at
+```
+
+A partir disso, o serviço de inferência não precisa depender diretamente do evento `q.model.promoted` para saber qual modelo deve usar. O evento continua existindo como registro da promoção, mas a referência operacional do modelo ativo passa a ser o `production.json`.
+
+Depois disso, implementei o:
+
+```text
+src/workers/infer_worker_real.py
+```
+
+Esse worker consome mensagens da fila:
+
+```text
+q.infer.request
+```
+
+Ele valida a mensagem usando o contrato Pydantic `InferRequestEvent`, lê o ponteiro de produção, carrega o modelo ONNX ativo e executa inferência real usando a classe `Detector`.
+
+O worker também verifica se o modelo ativo mudou. Antes de inferir, ele consulta o `production.json`; se a versão do modelo apontada no arquivo for diferente da versão carregada em memória, ele recarrega o modelo automaticamente.
+
+Com isso, o fluxo do worker de inferência ficou:
+
+```text
+q.infer.request
+→ lê production.json
+→ carrega ou recarrega o modelo ONNX ativo
+→ executa inferência real
+→ gera inference_id
+→ salva resultado
+→ publica q.infer.result
+```
+
+No teste realizado, o worker executou inferência sobre a imagem:
+
+```text
+data/stream/images/BloodImage_00000.jpg
+```
+
+O resultado foi salvo em:
+
+```text
+storage/inference_results/results.jsonl
+```
+
+e publicado em:
+
+```text
+q.infer.result
+```
+
+A inferência gerou o identificador:
+
+```text
+inf-da3eb216
+```
+
+com `min_conf` abaixo do limite definido, o que permitiu testar a etapa de coleta.
+
+Em seguida, implementei o:
+
+```text
+src/workers/collect_worker_real.py
+```
+
+Esse worker consome mensagens da fila:
+
+```text
+q.infer.result
+```
+
+Ele valida o resultado de inferência com `InferResultEvent`, verifica o campo `min_conf` e compara com o threshold:
+
+```text
+LOW_CONF_THRESHOLD = 0.50
+```
+
+Quando a confiança mínima fica abaixo desse limite, o worker marca o caso como candidato à anotação. No teste realizado, a inferência teve:
+
+```text
+min_conf=0.32289034128189087
+```
+
+Como esse valor é menor que `0.50`, o `Collect Worker real` criou uma tarefa em:
+
+```text
+q.label.task
+```
+
+Também salvou metadados do candidato em:
+
+```text
+storage/label_candidates/candidates.jsonl
+```
+
+e copiou a imagem candidata para:
+
+```text
+storage/label_candidates/images/
+```
+
+Mantive a decisão de o `Collect Worker real` não disparar `q.data.build` automaticamente. Ele apenas seleciona o caso incerto e cria a tarefa de anotação. A reconstrução do dataset continua sendo uma etapa posterior.
+
+Depois disso, implementei o:
+
+```text
+src/workers/oracle_annotation_worker.py
+```
+
+Esse worker representa a anotação simulada da atividade. Como os rótulos verdadeiros das imagens de stream já existem no BCCD, mas ficam separados até a etapa de anotação, o worker funciona como um oráculo digital.
+
+Ele consome mensagens de:
+
+```text
+q.label.task
+```
+
+valida a mensagem com `LabelTaskEvent`, identifica a imagem selecionada e procura o rótulo verdadeiro correspondente em:
+
+```text
+data/oracle/labels/
+```
+
+No primeiro teste, a imagem selecionada foi:
+
+```text
+data/stream/images/BloodImage_00000.jpg
+```
+
+e o rótulo verdadeiro correspondente foi encontrado em:
+
+```text
+data/oracle/labels/BloodImage_00000.txt
+```
+
+O worker então copiou imagem e label para a fonte `raw`:
+
+```text
+data/raw/images/oracle_label-test-oracle-001_BloodImage_00000.jpg
+data/raw/labels/oracle_label-test-oracle-001_BloodImage_00000.txt
+```
+
+Também salvou um registro de rastreabilidade em:
+
+```text
+storage/oracle_annotations/annotations.jsonl
+```
+
+Com isso, a fonte `raw` cresceu com um novo exemplo anotado.
+
+Após validar a anotação simulada, ajustei o `Oracle Annotation Worker` para fechar o loop de feedback automaticamente.
+
+Antes, depois que o worker reinjetava imagem e label em `data/raw`, eu ainda precisava publicar manualmente uma nova mensagem em:
+
+```text
+q.data.build
+```
+
+Com o ajuste feito hoje, o `Oracle Annotation Worker` passou a publicar automaticamente um evento `data.build` com:
+
+```text
+trigger="feedback"
+```
+
+logo depois de copiar a imagem e o rótulo verdadeiro para a fonte `raw`.
+
+Com isso, o fluxo passou a ser:
+
+```text
+q.label.task
+→ Oracle Annotation Worker
+→ data/raw recebe imagem + label anotados
+→ q.data.build automático com trigger="feedback"
+→ Data Worker real
+→ novo dataset versionado
+```
+
+Esse comportamento mantém a decisão arquitetural de não deixar o `Collect Worker` disparar rebuild diretamente. O `Collect Worker` continua apenas selecionando casos de baixa confiança e criando tarefas de anotação. Quem fecha o loop é o `Oracle Annotation Worker`, mas somente depois que existe de fato um novo dado anotado em `data/raw`.
+
+Validei esse fluxo observando que, após o `Oracle Annotation Worker` consumir uma tarefa em `q.label.task`, a fila `q.data.build` ficou com uma nova mensagem pronta enquanto o `Data Worker real` ainda não estava rodando:
+
+```text
+q.label.task    0
+q.data.build    1
+```
+
+Em seguida, executei o `Data Worker real`, que consumiu esse `q.data.build` automático e criou um novo dataset versionado:
+
+```text
+ds-20260622-202001-870c13
+```
+
+O novo dataset foi criado com:
+
+```text
+train=65
+val=14
+test=14
+```
+
+e o log do Data Worker registrou:
+
+```text
+Added this cycle: 1
+Published train event to q.train.run
+```
+
+Isso confirmou que o dado anotado pelo oráculo entrou automaticamente no próximo ciclo do pipeline.
+
+Depois, fiz um ajuste importante no `Train Worker real`. A atividade pede que o treino faça fine-tune a partir do checkpoint vigente, e não sempre a partir do modelo inicial `v0`.
+
+Antes, o treino usava o checkpoint inicial como base fixa. Ajustei a lógica para:
+
+```text
+se storage/models/production.json existir:
+    usar o modelo promovido vigente como base
+senão:
+    usar models/v0/best.pt
+```
+
+Com isso, o `Train Worker real` passou a ler o ponteiro de produção e identificar o checkpoint atual. No teste, ele usou como base:
+
+```text
+base_model_version=model-20260622-160102-df2d2e
+base_model_path=C:\dev\mlops-pipeline-challenge\storage\models\model-20260622-160102-df2d2e\best.pt
+```
+
+Isso confirmou que o novo treino não partiu mais diretamente do `v0`, mas sim do modelo promovido vigente.
+
+O novo treino obteve:
+
+```text
+TEST mAP50=0.8552
+Baseline mAP50=0.5000
+```
+
+Como a métrica ficou acima do baseline, o modelo passou no gate de qualidade, foi registrado em:
+
+```text
+storage/models/model-20260622-182157-34ab11
+```
+
+e o ponteiro de produção foi atualizado para esse novo modelo.
+
+Também criei duas ferramentas auxiliares para melhorar a demonstração e atender melhor aos requisitos de rastreabilidade da inferência.
+
+A primeira foi:
+
+```text
+src/tools/check_inference_status.py
+```
+
+Esse comando lê o `production.json` e mostra o status do serviço de inferência e do modelo ativo. No teste, ele retornou:
+
+```text
+status=healthy
+model_version=model-20260622-182157-34ab11
+model_file_exists=true
+dataset_version=ds-20260622-172922-5d45af
+mAP50=0.8552
+base_model=model-20260622-160102-df2d2e
+```
+
+Com isso, ficou possível consultar rapidamente qual modelo está em produção, qual dataset gerou esse modelo, qual foi a métrica obtida e qual checkpoint serviu de base.
+
+A segunda ferramenta foi:
+
+```text
+src/tools/get_inference_result.py
+```
+
+Ela permite recuperar um resultado de inferência pelo `inference_id`, a partir do arquivo:
+
+```text
+storage/inference_results/results.jsonl
+```
+
+Testei com:
+
+```text
+inf-da3eb216
+```
+
+e o comando retornou corretamente o JSON completo da inferência, incluindo:
+
+```text
+inference_id
+model_version
+status
+image_uri
+latency_ms
+min_conf
+detections
+source_event
+```
+
+Também testei um ID inexistente:
+
+```text
+inf-nao-existe
+```
+
+e o comando retornou:
+
+```json
+{
+  "status": "not_found",
+  "inference_id": "inf-nao-existe",
+  "results_file": "C:\\dev\\mlops-pipeline-challenge\\storage\\inference_results\\results.jsonl"
+}
+```
+
+Isso deixou explícito que as inferências são persistidas e recuperáveis posteriormente por identificador.
+
+Por fim, ajustei o `Data Worker real` para melhorar a rastreabilidade dos datasets versionados. Antes, o campo `added_this_cycle` estava sempre como `0`. Isso não representava bem o ciclo, porque depois da anotação oracle havia de fato um novo exemplo reincorporado à fonte `raw`.
+
+Implementei então uma lógica para acompanhar o número de anotações oracle já processadas. O worker passou a ler:
+
+```text
+storage/oracle_annotations/annotations.jsonl
+```
+
+e manter um estado local em:
+
+```text
+storage/datasets/_data_worker_state.json
+```
+
+Com isso, o Data Worker consegue calcular quantas novas anotações entraram desde o último build.
+
+Também passei a salvar, dentro de cada dataset versionado, um arquivo:
+
+```text
+metadata.json
+```
+
+Esse arquivo registra:
+
+```text
+dataset_version
+dataset_uri
+raw_uri
+raw_dir
+classes
+counts
+added_this_cycle
+oracle_annotation_count
+created_at
+source_event
+```
+
+No primeiro build após a anotação oracle, o `metadata.json` registrou:
+
+```json
+{
+  "dataset_version": "ds-20260622-183654-3b96fe",
+  "counts": {
+    "train": 64,
+    "val": 14,
+    "test": 14
+  },
+  "added_this_cycle": 1,
+  "oracle_annotation_count": {
+    "previous": 0,
+    "current": 1
+  }
+}
+```
+
+Isso mostra que o dataset foi criado com uma nova anotação reincorporada no ciclo.
+
+Depois, disparei um novo build sem criar nenhuma nova anotação oracle. Nesse caso, o metadata registrou:
+
+```json
+{
+  "added_this_cycle": 0,
+  "oracle_annotation_count": {
+    "previous": 1,
+    "current": 1
+  }
+}
+```
+
+Esse comportamento está correto, porque não houve nova anotação desde o último build.
+
+Também preparei a atualização do `README.md`, documentando o ciclo completo, os workers, as filas RabbitMQ, os comandos de reprodução, o healthcheck, a recuperação por `inference_id`, a rastreabilidade de datasets/modelos e as limitações atuais.
+
+Os principais commits desta etapa foram:
+
+```text
+Add real inference worker with production model reload
+Add real collect worker for low-confidence samples
+Add oracle annotation worker
+Use current production checkpoint for training
+Add inference status and result lookup tools
+Track dataset metadata and added samples
+```
+
+#### O que aprendi
+
+Aprendi melhor a diferença entre evento de promoção e estado operacional do modelo em produção.
+
+O evento:
+
+```text
+q.model.promoted
+```
+
+é importante para registrar que um modelo passou no gate de qualidade e foi promovido. Porém, para o serviço de inferência, é mais prático consultar um ponteiro de produção:
+
+```text
+storage/models/production.json
+```
+
+Assim, o `Inference Worker real` não precisa depender diretamente da fila de promoção para funcionar. Mesmo que ele seja iniciado depois do treino, ele consegue descobrir sozinho qual modelo está ativo.
+
+Também aprendi melhor o papel do checkpoint vigente no ciclo de vida do modelo. Em um pipeline contínuo, o próximo treino não deve sempre partir do `v0`. Depois que um modelo foi promovido, ele passa a ser o ponto de partida natural para o próximo fine-tuning.
+
+Com isso, o ciclo deixa de ser:
+
+```text
+v0 → modelo novo
+v0 → modelo novo
+v0 → modelo novo
+```
+
+e passa a ser:
+
+```text
+v0 → modelo 1 → modelo 2 → modelo 3
+```
+
+Isso representa melhor um processo de melhoria incremental.
+
+Outro aprendizado foi sobre a separação entre coleta, anotação e reconstrução do dataset.
+
+A coleta identifica um caso útil ou incerto. A anotação simulada recupera o rótulo verdadeiro desse caso. A reconstrução do dataset só deve acontecer depois que o novo dado anotado realmente existe em `data/raw`.
+
+Por isso, mantive a decisão de não deixar o `Collect Worker` publicar `q.data.build` diretamente. Uma inferência de baixa confiança ainda não significa que existe um novo dado pronto para treino; ela apenas indica que aquele exemplo deve virar uma tarefa de anotação.
+
+Com o ajuste feito hoje, o gatilho automático passou a acontecer no ponto correto do fluxo: o `Oracle Annotation Worker`.
+
+Depois que ele consome uma tarefa em:
+
+```text
+q.label.task
+```
+
+recupera o rótulo verdadeiro e reinjeta imagem + label em:
+
+```text
+data/raw
+```
+
+ele publica automaticamente uma nova mensagem em:
+
+```text
+q.data.build
+```
+
+com:
+
+```text
+trigger="feedback"
+```
+
+Assim, o loop fica automático sem reconstruir o dataset imediatamente após qualquer baixa confiança. O rebuild acontece apenas depois que a anotação simulada foi concluída.
+
+Também aprendi a importância de persistir resultados de inferência por `inference_id`. Sem isso, a inferência seria apenas uma mensagem transitória na fila. Ao salvar os resultados em `results.jsonl` e criar uma ferramenta de recuperação, fica possível auditar o que foi inferido, qual modelo gerou a predição e quais detecções foram produzidas.
+
+Além disso, aprendi que a rastreabilidade do dataset não depende apenas de salvar os arquivos de imagem e label. É importante registrar metadados do build, como a versão do dataset, a quantidade de imagens em cada split, o evento que originou o build e quantas novas amostras foram incorporadas naquele ciclo.
+
+O campo `added_this_cycle` ajudou a deixar explícito quando o dataset cresceu de fato por causa da anotação simulada.
+
+#### Decisões tomadas
+
+Decidi manter o `q.model.promoted` como evento de rastreabilidade, mas usar o arquivo `production.json` como fonte operacional para o modelo ativo.
+
+Essa decisão reduz o acoplamento entre treino e inferência. O Train Worker publica o evento de promoção, atualiza o ponteiro de produção, e o Inference Worker apenas consulta esse ponteiro para carregar o modelo correto.
+
+Também decidi que o `Train Worker real` deve usar o checkpoint vigente quando ele existir, e cair para `v0` apenas se ainda não houver modelo promovido. Isso deixa o ciclo mais próximo de um pipeline real de fine-tuning contínuo.
+
+Decidi manter o `Collect Worker real` sem publicar `q.data.build` diretamente. Ele apenas seleciona casos de baixa confiança e cria tarefas de anotação em:
+
+```text
+q.label.task
+```
+
+A razão é que baixa confiança ainda não significa novo dado pronto para treino. Ela apenas indica que aquele exemplo deve passar por uma etapa de anotação.
+
+Por outro lado, depois que o `Oracle Annotation Worker` processa essa tarefa e reinjeta imagem e label em `data/raw`, já existe um novo exemplo anotado disponível. Por isso, decidi que o `Oracle Annotation Worker` deve publicar automaticamente um novo `q.data.build` com:
+
+```text
+trigger="feedback"
+```
+
+Essa decisão fecha o loop automaticamente, mas mantém uma separação correta de responsabilidades:
+
+```text
+Collect Worker → seleciona candidatos
+Oracle Annotation Worker → simula anotação e publica novo build
+Data Worker → cria novo dataset
+```
+
+Também decidi implementar a anotação simulada como um worker próprio:
+
+```text
+src/workers/oracle_annotation_worker.py
+```
+
+Isso deixa a arquitetura mais clara, porque seleção e anotação são responsabilidades diferentes.
+
+Outra decisão foi registrar os resultados de inferência em um arquivo JSONL e criar uma ferramenta de busca por `inference_id`. Isso atende à necessidade de que o resultado da inferência seja recuperável depois e facilita a demonstração.
+
+Também decidi criar uma ferramenta simples de status da inferência, baseada no `production.json`, em vez de implementar uma API REST neste momento. Para o objetivo atual do projeto, a ferramenta de status já permite verificar qual modelo está ativo, qual dataset originou esse modelo e se o arquivo ONNX existe.
+
+Por fim, decidi adicionar `metadata.json` nos datasets versionados e calcular `added_this_cycle` com base nas anotações oracle processadas. Isso melhorou a rastreabilidade entre anotação simulada, crescimento da fonte raw e criação de novos datasets.
+
+Com isso, considero que o projeto já demonstra o ciclo de MLOps de ponta a ponta, com workers independentes, comunicação por RabbitMQ, versionamento de dataset, treino com gate de qualidade, modelo em produção rastreável, inferência real, coleta de baixa confiança, anotação simulada, publicação automática de `q.data.build` após feedback e reincorporação dos dados ao ciclo.
