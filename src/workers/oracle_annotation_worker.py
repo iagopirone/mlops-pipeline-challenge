@@ -18,19 +18,27 @@ from src.messaging.rabbitmq import (  # noqa: E402
     create_connection,
     declare_queues,
     parse_json_body,
+    publish_json,
 )
 
 
 LABEL_TASK_QUEUE = "q.label.task"
+DATA_BUILD_QUEUE = "q.data.build"
 
 RAW_IMAGES_DIR = ROOT_DIR / "data" / "raw" / "images"
 RAW_LABELS_DIR = ROOT_DIR / "data" / "raw" / "labels"
 
-ANNOTATION_RECORDS_DIR = ROOT_DIR / "storage" / "oracle_annotations"
-ANNOTATION_RECORDS_FILE = ANNOTATION_RECORDS_DIR / "annotations.jsonl"
+ORACLE_LABELS_DIR = ROOT_DIR / "data" / "oracle" / "labels"
+
+ANNOTATION_LOG_FILE = ROOT_DIR / "storage" / "oracle_annotations" / "annotations.jsonl"
 
 QUEUES = [
     LABEL_TASK_QUEUE,
+    DATA_BUILD_QUEUE,
+    "q.train.run",
+    "q.model.promoted",
+    "q.infer.request",
+    "q.infer.result",
 ]
 
 
@@ -47,114 +55,104 @@ def resolve_project_path(path_as_string: str) -> Path:
     return ROOT_DIR / path
 
 
-def candidate_label_paths(image_path: Path) -> list[Path]:
-    """
-    Builds possible oracle label paths for an image.
+def append_jsonl(file_path: Path, record: dict) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    In this MVP, the digital annotation is simulated by recovering an existing
-    YOLO label file with the same image stem.
+    with file_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def find_oracle_label_for_image(image_path: Path) -> Path:
+    """
+    Finds the hidden/oracle label associated with a stream image.
+
+    Example:
+        data/stream/images/BloodImage_00000.jpg
+        data/oracle/labels/BloodImage_00000.txt
     """
     stem = image_path.stem
 
-    candidates: list[Path] = []
+    candidate_label_paths = [
+        ORACLE_LABELS_DIR / f"{stem}.txt",
+        ROOT_DIR / "data" / "raw" / "labels" / f"{stem}.txt",
+        ROOT_DIR / "data" / "labels" / f"{stem}.txt",
+        ROOT_DIR / "storage" / "datasets" / "labels" / f"{stem}.txt",
+    ]
 
-    if image_path.parent.name == "images":
-        candidates.append(image_path.parent.parent / "labels" / f"{stem}.txt")
+    for candidate_path in candidate_label_paths:
+        if candidate_path.exists():
+            return candidate_path
 
-    candidates.extend(
-        [
-            ROOT_DIR / "data" / "stream" / "labels" / f"{stem}.txt",
-            ROOT_DIR / "data" / "oracle" / "labels" / f"{stem}.txt",
-            ROOT_DIR / "data" / "raw" / "labels" / f"{stem}.txt",
-            ROOT_DIR / "data" / "labels" / f"{stem}.txt",
-            ROOT_DIR / "dataset" / "labels" / "train" / f"{stem}.txt",
-            ROOT_DIR / "dataset" / "labels" / "val" / f"{stem}.txt",
-            ROOT_DIR / "dataset" / "labels" / "test" / f"{stem}.txt",
-        ]
-    )
-
-    unique_candidates = []
-    seen = set()
-
-    for candidate in candidates:
-        if candidate not in seen:
-            unique_candidates.append(candidate)
-            seen.add(candidate)
-
-    return unique_candidates
-
-
-def find_oracle_label(image_path: Path) -> Path:
-    """
-    Finds the existing label file used as a digital oracle.
-    """
-    for label_path in candidate_label_paths(image_path):
-        if label_path.exists():
-            return label_path
-
-    searched_paths = "\n".join(str(path) for path in candidate_label_paths(image_path))
     raise FileNotFoundError(
-        "Could not find oracle label for image.\n"
-        f"image_path={image_path}\n"
-        f"searched_paths=\n{searched_paths}"
+        "Could not find oracle label for image "
+        f"{image_path}. Tried: {[str(path) for path in candidate_label_paths]}"
     )
 
 
-def inject_annotated_sample(label_task_event: LabelTaskEvent) -> tuple[str, str]:
+def copy_annotated_sample_to_raw(label_task_event: LabelTaskEvent) -> tuple[Path, Path]:
     """
-    Copies the selected image and its oracle label into data/raw.
+    Copies the selected stream image and its hidden/oracle label back to data/raw.
 
-    The generated files are prefixed with oracle_<label_task_id>_ to avoid
-    overwriting existing files and to make the source clear.
+    This simulates the result of a human annotation step.
     """
-    image_path = resolve_project_path(label_task_event.image_uri)
+    source_image_path = resolve_project_path(label_task_event.image_uri)
 
-    if not image_path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
+    if not source_image_path.exists():
+        raise FileNotFoundError(f"Source image not found: {source_image_path}")
 
-    label_path = find_oracle_label(image_path)
+    oracle_label_path = find_oracle_label_for_image(source_image_path)
 
     RAW_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     RAW_LABELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    target_image_name = f"oracle_{label_task_event.label_task_id}_{image_path.name}"
-    target_image_path = RAW_IMAGES_DIR / target_image_name
-    target_label_path = RAW_LABELS_DIR / f"{target_image_path.stem}.txt"
+    target_stem = f"oracle_{label_task_event.label_task_id}_{source_image_path.stem}"
 
-    shutil.copy2(image_path, target_image_path)
-    shutil.copy2(label_path, target_label_path)
+    target_image_path = RAW_IMAGES_DIR / f"{target_stem}{source_image_path.suffix}"
+    target_label_path = RAW_LABELS_DIR / f"{target_stem}.txt"
 
-    target_image_uri = target_image_path.relative_to(ROOT_DIR).as_posix()
-    target_label_uri = target_label_path.relative_to(ROOT_DIR).as_posix()
+    shutil.copy2(source_image_path, target_image_path)
+    shutil.copy2(oracle_label_path, target_label_path)
 
-    return target_image_uri, target_label_uri
+    return target_image_path, target_label_path
 
 
-def save_annotation_record(
+def build_annotation_record(
     label_task_event: LabelTaskEvent,
-    target_image_uri: str,
-    target_label_uri: str,
-) -> None:
-    """
-    Saves a traceability record for the oracle annotation.
-    """
-    ANNOTATION_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-
-    record = {
+    target_image_path: Path,
+    target_label_path: Path,
+) -> dict:
+    return {
         "event": "oracle.annotation.completed",
         "label_task_id": label_task_event.label_task_id,
         "inference_id": label_task_event.inference_id,
         "source_image_uri": label_task_event.image_uri,
-        "target_image_uri": target_image_uri,
-        "target_label_uri": target_label_uri,
+        "target_image_uri": target_image_path.relative_to(ROOT_DIR).as_posix(),
+        "target_label_uri": target_label_path.relative_to(ROOT_DIR).as_posix(),
         "model_version": label_task_event.model_version,
         "min_conf": label_task_event.min_conf,
         "threshold": label_task_event.threshold,
         "created_at": utc_now(),
+        "source_event": label_task_event.model_dump(mode="json"),
     }
 
-    with ANNOTATION_RECORDS_FILE.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record) + "\n")
+
+def build_feedback_data_build_message() -> dict:
+    """
+    Builds a data.build event triggered by the feedback loop.
+
+    This is published only after the oracle annotation worker has actually
+    injected a new image + label pair into data/raw.
+    """
+    return {
+        "event": "data.build",
+        "trigger": "feedback",
+        "raw_uri": "data/raw",
+        "params": {
+            "val_frac": 0.15,
+            "test_frac": 0.15,
+            "seed": 42,
+        },
+    }
 
 
 def on_message(channel, method, properties, body) -> None:
@@ -164,22 +162,41 @@ def on_message(channel, method, properties, body) -> None:
         raw_message = parse_json_body(body)
         label_task_event = LabelTaskEvent.model_validate(raw_message)
 
-        print("[Oracle Annotation Worker] Validated label task:")
+        print("[Oracle Annotation Worker] Validated input event:")
         print(label_task_event.model_dump(mode="json"))
 
-        target_image_uri, target_label_uri = inject_annotated_sample(label_task_event)
-
-        save_annotation_record(
-            label_task_event=label_task_event,
-            target_image_uri=target_image_uri,
-            target_label_uri=target_label_uri,
+        target_image_path, target_label_path = copy_annotated_sample_to_raw(
+            label_task_event
         )
 
-        print("[Oracle Annotation Worker] Digital annotation completed")
-        print(f"[Oracle Annotation Worker] Injected image: {target_image_uri}")
-        print(f"[Oracle Annotation Worker] Injected label: {target_label_uri}")
-        print(f"[Oracle Annotation Worker] Record saved to {ANNOTATION_RECORDS_FILE}")
-        print("[Oracle Annotation Worker] q.data.build was NOT triggered automatically")
+        annotation_record = build_annotation_record(
+            label_task_event=label_task_event,
+            target_image_path=target_image_path,
+            target_label_path=target_label_path,
+        )
+
+        append_jsonl(
+            file_path=ANNOTATION_LOG_FILE,
+            record=annotation_record,
+        )
+
+        print("[Oracle Annotation Worker] Oracle annotation completed")
+        print(f"  target_image={target_image_path}")
+        print(f"  target_label={target_label_path}")
+        print(f"  annotation_log={ANNOTATION_LOG_FILE}")
+
+        data_build_message = build_feedback_data_build_message()
+
+        publish_json(
+            channel=channel,
+            queue=DATA_BUILD_QUEUE,
+            message=data_build_message,
+        )
+
+        print(
+            "[Oracle Annotation Worker] Published feedback data build event "
+            f"to {DATA_BUILD_QUEUE}"
+        )
 
         channel.basic_ack(delivery_tag=method.delivery_tag)
         print("[Oracle Annotation Worker] Message acknowledged")
@@ -190,7 +207,7 @@ def on_message(channel, method, properties, body) -> None:
         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
     except Exception as error:
-        print(f"[Oracle Annotation Worker] Error while processing label task: {error}")
+        print(f"[Oracle Annotation Worker] Error while processing message: {error}")
         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 
@@ -210,8 +227,6 @@ def main() -> None:
 
     print(f"[Oracle Annotation Worker] Waiting for messages from {LABEL_TASK_QUEUE}")
     print("[Oracle Annotation Worker] Press CTRL+C to stop")
-    print("[Oracle Annotation Worker] This worker simulates digital annotation")
-    print("[Oracle Annotation Worker] It does not trigger q.data.build automatically")
 
     try:
         channel.start_consuming()
