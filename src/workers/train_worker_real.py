@@ -32,8 +32,11 @@ from src.messaging.rabbitmq import (  # noqa: E402
 TRAIN_RUN_QUEUE = "q.train.run"
 MODEL_PROMOTED_QUEUE = "q.model.promoted"
 
-BASE_MODEL = "models/v0/best.pt"
+DEFAULT_BASE_MODEL_VERSION = "v0"
+DEFAULT_BASE_MODEL_URI = "models/v0"
+
 BASELINE_MAP50 = 0.50
+
 PRODUCTION_POINTER_FILE = ROOT_DIR / "storage" / "models" / "production.json"
 
 EPOCHS = 1
@@ -69,6 +72,47 @@ def resolve_project_path(path_as_string: str) -> Path:
     return ROOT_DIR / path
 
 
+def read_production_pointer() -> dict | None:
+    """
+    Reads the current production model pointer.
+
+    If no promoted model exists yet, the training worker falls back to v0.
+    """
+    if not PRODUCTION_POINTER_FILE.exists():
+        return None
+
+    return json.loads(PRODUCTION_POINTER_FILE.read_text(encoding="utf-8"))
+
+
+def get_current_checkpoint() -> tuple[str, Path]:
+    """
+    Returns the checkpoint that should be used as the base for fine-tuning.
+
+    If a production model exists, use its best.pt.
+    Otherwise, use the initial v0 checkpoint.
+    """
+    pointer = read_production_pointer()
+
+    if pointer is None:
+        base_model_path = resolve_project_path(DEFAULT_BASE_MODEL_URI) / "best.pt"
+        return DEFAULT_BASE_MODEL_VERSION, base_model_path
+
+    model_version = pointer["model_version"]
+    model_uri = pointer["model_uri"]
+
+    base_model_path = resolve_project_path(model_uri) / "best.pt"
+
+    if not base_model_path.exists():
+        print(
+            "[Train Worker Real] Warning: production checkpoint not found. "
+            "Falling back to v0."
+        )
+        fallback_path = resolve_project_path(DEFAULT_BASE_MODEL_URI) / "best.pt"
+        return DEFAULT_BASE_MODEL_VERSION, fallback_path
+
+    return model_version, base_model_path
+
+
 def parse_map50(train_stdout: str) -> float:
     """
     Extracts the TEST mAP50 printed by src/train.py.
@@ -87,9 +131,12 @@ def parse_map50(train_stdout: str) -> float:
 def run_training(
     train_run_event: TrainRunEvent,
     model_version: str,
-) -> tuple[float, Path]:
+) -> tuple[float, Path, str]:
     """
     Runs src/train.py using the dataset received from q.train.run.
+
+    The base checkpoint is the current production model if it exists.
+    Otherwise, the worker falls back to the initial v0 checkpoint.
     """
     dataset_dir = resolve_project_path(train_run_event.dataset_uri)
     data_yaml = dataset_dir / "data.yaml"
@@ -97,11 +144,14 @@ def run_training(
     if not data_yaml.exists():
         raise FileNotFoundError(f"Dataset data.yaml not found: {data_yaml}")
 
+    base_model_version, base_model_path = get_current_checkpoint()
+
     print("[Train Worker Real] Starting training")
     print(f"  dataset_version={train_run_event.dataset_version}")
     print(f"  dataset_uri={train_run_event.dataset_uri}")
     print(f"  data_yaml={data_yaml}")
-    print(f"  base_model={BASE_MODEL}")
+    print(f"  base_model_version={base_model_version}")
+    print(f"  base_model_path={base_model_path}")
     print(f"  epochs={EPOCHS}")
 
     command = [
@@ -110,7 +160,7 @@ def run_training(
         "--data",
         str(data_yaml),
         "--base",
-        str(ROOT_DIR / BASE_MODEL),
+        str(base_model_path),
         "--epochs",
         str(EPOCHS),
         "--imgsz",
@@ -129,7 +179,7 @@ def run_training(
         text=True,
         encoding="utf-8",
         errors="replace",
-)
+    )
 
     print("[Train Worker Real] train.py stdout:")
     print(result.stdout)
@@ -143,7 +193,7 @@ def run_training(
     run_dir = ROOT_DIR / "runs" / model_version
     weights_dir = run_dir / "weights"
 
-    return map50, weights_dir
+    return map50, weights_dir, base_model_version
 
 
 def register_model_artifacts(
@@ -178,12 +228,13 @@ def build_model_promoted_event(
     model_version: str,
     model_dir: Path,
     map50: float,
+    base_model_version: str,
 ) -> ModelPromotedEvent:
     model_uri = model_dir.relative_to(ROOT_DIR).as_posix()
 
     return ModelPromotedEvent(
         model_version=model_version,
-        base_model=BASE_MODEL,
+        base_model=base_model_version,
         model_uri=model_uri,
         dataset_version=train_run_event.dataset_version,
         metrics=ModelMetrics(
@@ -195,6 +246,7 @@ def build_model_promoted_event(
         created_at=utc_now(),
         source_event=train_run_event.model_dump(mode="json"),
     )
+
 
 def update_production_pointer(model_promoted_event: ModelPromotedEvent) -> None:
     """
@@ -211,6 +263,7 @@ def update_production_pointer(model_promoted_event: ModelPromotedEvent) -> None:
         "dataset_version": model_promoted_event.dataset_version,
         "metrics": model_promoted_event.metrics.model_dump(mode="json"),
         "baseline": model_promoted_event.baseline,
+        "base_model": model_promoted_event.base_model,
         "updated_at": utc_now(),
     }
 
@@ -236,7 +289,7 @@ def on_message(channel, method, properties, body) -> None:
 
         model_version = make_model_version()
 
-        map50, weights_dir = run_training(
+        map50, weights_dir, base_model_version = run_training(
             train_run_event=train_run_event,
             model_version=model_version,
         )
@@ -262,7 +315,7 @@ def on_message(channel, method, properties, body) -> None:
             model_version=model_version,
             model_dir=model_dir,
             map50=map50,
-            
+            base_model_version=base_model_version,
         )
 
         update_production_pointer(model_promoted_event)
