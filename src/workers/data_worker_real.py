@@ -1,7 +1,9 @@
+import json
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -30,6 +32,9 @@ DATA_BUILD_QUEUE = "q.data.build"
 TRAIN_RUN_QUEUE = "q.train.run"
 
 CLASSES = ["RBC", "WBC", "Platelets"]
+
+ORACLE_ANNOTATION_LOG_FILE = ROOT_DIR / "storage" / "oracle_annotations" / "annotations.jsonl"
+DATA_WORKER_STATE_FILE = ROOT_DIR / "storage" / "datasets" / "_data_worker_state.json"
 
 QUEUES = [
     DATA_BUILD_QUEUE,
@@ -86,6 +91,93 @@ def count_images_in_split(dataset_dir: Path, split: str) -> int:
     return total
 
 
+def count_jsonl_records(file_path: Path) -> int:
+    """
+    Counts non-empty records in a JSONL file.
+
+    This is used to estimate how many oracle annotations have already
+    been reincorporated into the raw source.
+    """
+    if not file_path.exists():
+        return 0
+
+    total = 0
+
+    with file_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            if line.strip():
+                total += 1
+
+    return total
+
+
+def read_data_worker_state() -> dict[str, Any]:
+    """
+    Reads the Data Worker state.
+
+    The state stores how many oracle annotations had already been seen
+    by the previous dataset build. This allows the worker to estimate
+    added_this_cycle in the next build.
+    """
+    if not DATA_WORKER_STATE_FILE.exists():
+        return {
+            "last_oracle_annotation_count": 0,
+            "last_dataset_version": None,
+        }
+
+    try:
+        return json.loads(DATA_WORKER_STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(
+            "[Data Worker Real] Warning: could not parse data worker state. "
+            "Falling back to zero."
+        )
+        return {
+            "last_oracle_annotation_count": 0,
+            "last_dataset_version": None,
+        }
+
+
+def get_annotation_progress() -> tuple[int, int, int]:
+    """
+    Returns:
+        added_this_cycle
+        current_oracle_annotation_count
+        previous_oracle_annotation_count
+    """
+    state = read_data_worker_state()
+
+    previous_count = int(state.get("last_oracle_annotation_count", 0))
+    current_count = count_jsonl_records(ORACLE_ANNOTATION_LOG_FILE)
+
+    added_this_cycle = max(0, current_count - previous_count)
+
+    return added_this_cycle, current_count, previous_count
+
+
+def update_data_worker_state(
+    dataset_version: str,
+    oracle_annotation_count: int,
+) -> None:
+    """
+    Updates the Data Worker state after a successful dataset build.
+    """
+    DATA_WORKER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    state = {
+        "last_dataset_version": dataset_version,
+        "last_oracle_annotation_count": oracle_annotation_count,
+        "updated_at": utc_now(),
+    }
+
+    temp_file = DATA_WORKER_STATE_FILE.with_suffix(".tmp")
+    temp_file.write_text(
+        json.dumps(state, indent=2),
+        encoding="utf-8",
+    )
+    temp_file.replace(DATA_WORKER_STATE_FILE)
+
+
 def build_dataset(data_build_message: DataBuildMessage) -> tuple[str, Path, DatasetCounts]:
     """
     Runs prep_data.py to create a versioned dataset.
@@ -129,11 +221,56 @@ def build_dataset(data_build_message: DataBuildMessage) -> tuple[str, Path, Data
     return dataset_version, dataset_dir, counts
 
 
+def write_dataset_metadata(
+    data_build_message: DataBuildMessage,
+    dataset_version: str,
+    dataset_dir: Path,
+    counts: DatasetCounts,
+    added_this_cycle: int,
+    current_oracle_annotation_count: int,
+    previous_oracle_annotation_count: int,
+) -> None:
+    """
+    Writes metadata for the versioned dataset.
+
+    This file improves traceability: it links a dataset version to
+    the raw source, split counts, source event, and number of newly
+    reincorporated oracle annotations.
+    """
+    raw_dir = resolve_project_path(data_build_message.raw_uri)
+    dataset_uri = dataset_dir.relative_to(ROOT_DIR).as_posix()
+
+    metadata = {
+        "dataset_version": dataset_version,
+        "dataset_uri": dataset_uri,
+        "raw_uri": data_build_message.raw_uri,
+        "raw_dir": str(raw_dir),
+        "classes": CLASSES,
+        "counts": counts.model_dump(mode="json"),
+        "added_this_cycle": added_this_cycle,
+        "oracle_annotation_count": {
+            "previous": previous_oracle_annotation_count,
+            "current": current_oracle_annotation_count,
+        },
+        "created_at": utc_now(),
+        "source_event": data_build_message.model_dump(mode="json"),
+    }
+
+    metadata_file = dataset_dir / "metadata.json"
+    metadata_file.write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"[Data Worker Real] Dataset metadata written to {metadata_file}")
+
+
 def build_train_event(
     data_build_message: DataBuildMessage,
     dataset_version: str,
     dataset_dir: Path,
     counts: DatasetCounts,
+    added_this_cycle: int,
 ) -> TrainRunEvent:
     dataset_uri = dataset_dir.relative_to(ROOT_DIR).as_posix()
 
@@ -143,7 +280,7 @@ def build_train_event(
         dataset_uri=dataset_uri,
         classes=CLASSES,
         counts=counts,
-        added_this_cycle=0,
+        added_this_cycle=added_this_cycle,
         created_at=utc_now(),
         source_event=data_build_message.model_dump(mode="json"),
     )
@@ -159,13 +296,35 @@ def on_message(channel, method, properties, body) -> None:
         print("[Data Worker Real] Validated input event:")
         print(data_build_message.model_dump(mode="json"))
 
+        (
+            added_this_cycle,
+            current_oracle_annotation_count,
+            previous_oracle_annotation_count,
+        ) = get_annotation_progress()
+
+        print("[Data Worker Real] Annotation progress:")
+        print(f"  previous_oracle_annotation_count={previous_oracle_annotation_count}")
+        print(f"  current_oracle_annotation_count={current_oracle_annotation_count}")
+        print(f"  added_this_cycle={added_this_cycle}")
+
         dataset_version, dataset_dir, counts = build_dataset(data_build_message)
+
+        write_dataset_metadata(
+            data_build_message=data_build_message,
+            dataset_version=dataset_version,
+            dataset_dir=dataset_dir,
+            counts=counts,
+            added_this_cycle=added_this_cycle,
+            current_oracle_annotation_count=current_oracle_annotation_count,
+            previous_oracle_annotation_count=previous_oracle_annotation_count,
+        )
 
         train_event = build_train_event(
             data_build_message=data_build_message,
             dataset_version=dataset_version,
             dataset_dir=dataset_dir,
             counts=counts,
+            added_this_cycle=added_this_cycle,
         )
 
         publish_json(
@@ -174,8 +333,14 @@ def on_message(channel, method, properties, body) -> None:
             message=train_event.model_dump(mode="json"),
         )
 
+        update_data_worker_state(
+            dataset_version=dataset_version,
+            oracle_annotation_count=current_oracle_annotation_count,
+        )
+
         print(f"[Data Worker Real] Dataset version created: {dataset_version}")
         print(f"[Data Worker Real] Counts: {counts.model_dump(mode='json')}")
+        print(f"[Data Worker Real] Added this cycle: {added_this_cycle}")
         print(f"[Data Worker Real] Published train event to {TRAIN_RUN_QUEUE}")
 
         channel.basic_ack(delivery_tag=method.delivery_tag)
