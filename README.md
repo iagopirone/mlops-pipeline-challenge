@@ -343,8 +343,8 @@ Exemplo:
 │       └── best.pt
 │
 ├── scripts/
-│   ├── demo_pipeline.ps1
-│   └── demo_pipeline.sh
+│   ├── demo_compose.ps1
+│   └── demo_compose.sh
 │
 ├── src/
 │   ├── contracts/
@@ -813,39 +813,65 @@ Get-ChildItem "$($latest.FullName)\labels" -Recurse -Filter "oracle_*"
 
 ### 9.12 Demo guiada por scripts
 
-Além da execução manual descrita acima, o projeto inclui scripts de demonstração guiada para facilitar a reprodução do fluxo principal em outra máquina.
+Além da execução manual descrita acima, o projeto inclui scripts de demonstração guiada para facilitar a reprodução do fluxo principal em outra máquina usando Docker Compose.
 
 Existem duas versões:
 
 ```text
-scripts/demo_pipeline.ps1   → Windows PowerShell
-scripts/demo_pipeline.sh    → Linux/macOS
+scripts/demo_compose.ps1   → Windows PowerShell
+scripts/demo_compose.sh    → Linux/macOS
 ```
+
+Esses scripts sobem o ambiente completo com Docker Compose, incluindo:
+
+```text
+RabbitMQ
+Data Worker
+Train Worker
+Inference Worker
+Collect Worker
+Oracle Annotation Worker
+```
+
+A versão final usa duas imagens Docker:
+
+```text
+mlops-pipeline-workers:latest        → workers leves
+mlops-pipeline-train-worker:latest   → Train Worker com PyTorch CPU + Ultralytics
+```
+
+Essa separação evita que todos os workers carreguem dependências pesadas de treinamento, mantendo a imagem operacional mais leve e deixando o treino isolado em uma imagem específica.
 
 #### Windows PowerShell
 
-Para rodar a demonstração rápida do loop de feedback no Windows:
+Para rodar a demonstração completa no Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\demo_pipeline.ps1 -Mode feedback
+powershell -ExecutionPolicy Bypass -File scripts\demo_compose.ps1 -WaitSeconds 120
 ```
 
 #### Linux/macOS
 
-Para rodar a mesma demonstração no Linux ou macOS:
+Para validar a sintaxe do script Linux/macOS sem executar a demo:
 
 ```bash
-bash scripts/demo_pipeline.sh feedback
+bash -n scripts/demo_compose.sh
+```
+
+Para rodar a demonstração completa no Linux ou macOS:
+
+```bash
+WAIT_SECONDS=120 bash scripts/demo_compose.sh
 ```
 
 Opcionalmente, no Linux/macOS, também é possível tornar o script executável:
 
 ```bash
-chmod +x scripts/demo_pipeline.sh
-./scripts/demo_pipeline.sh feedback
+chmod +x scripts/demo_compose.sh
+WAIT_SECONDS=120 ./scripts/demo_compose.sh
 ```
 
-O modo `feedback` demonstra o seguinte fluxo:
+O script demonstra o seguinte fluxo:
 
 ```text
 q.infer.result
@@ -855,54 +881,67 @@ q.infer.result
 → data/raw recebe imagem + label anotados
 → q.data.build automático com trigger="feedback"
 → Data Worker real
+→ nova versão de dataset
 → q.train.run
+→ Train Worker real
+→ treino do modelo
+→ avaliação no conjunto de teste
+→ gate de qualidade
+→ atualização de production.json
+→ q.model.promoted
 ```
 
-Durante a execução, os scripts:
+Durante a execução, o script:
 
 ```text
-sobem o RabbitMQ com Docker Compose
-declaram as filas necessárias
-limpam as filas, salvo quando a opção de manter filas é usada
-iniciam os workers necessários
-publicam um resultado de inferência fake com baixa confiança
-verificam o estado das filas
-validam que o Oracle Annotation Worker publicou q.data.build automaticamente
-validam que o Data Worker consumiu q.data.build e publicou q.train.run
+sobe o RabbitMQ e todos os workers com Docker Compose
+declara as filas necessárias
+limpa as filas, salvo quando a opção de manter filas é usada
+publica um resultado de inferência com baixa confiança em q.infer.result
+verifica o estado das filas
+valida que o Collect Worker publicou q.label.task
+valida que o Oracle Annotation Worker publicou q.data.build automaticamente
+valida que o Data Worker consumiu q.data.build e publicou q.train.run
+valida que o Train Worker consumiu q.train.run, treinou o modelo e aplicou o gate de qualidade
 ```
 
-Resultado esperado antes do Data Worker consumir o build de feedback:
+O evento de baixa confiança publicado pelo script simula uma inferência em que o modelo não está suficientemente seguro. Isso força o pipeline a selecionar o exemplo para anotação, reconstruir o dataset e iniciar um novo ciclo de treino.
+
+Um resultado esperado ao final da execução é semelhante a:
 
 ```text
-q.infer.result  0
-q.label.task    0
-q.data.build    1
+q.infer.result    0
+q.label.task      0
+q.data.build      0
+q.train.run       0
+q.model.promoted  1
 ```
 
-Resultado esperado depois do Data Worker:
+A fila `q.model.promoted` pode aparecer com uma mensagem pronta e zero consumidores. Isso é esperado nesta versão da arquitetura. O evento em `q.model.promoted` funciona como rastreabilidade da promoção, enquanto o estado operacional do modelo em produção é representado pelo arquivo:
 
 ```text
-q.data.build    0
-q.train.run     1
+storage/models/production.json
 ```
 
-No Linux/macOS, os workers são iniciados em background e os logs ficam salvos em:
-
-```text
-.demo_logs/
-```
-
-Exemplos:
+Os logs dos workers podem ser consultados com:
 
 ```bash
-cat .demo_logs/collect_worker_real.log
-cat .demo_logs/oracle_annotation_worker.log
-cat .demo_logs/data_worker_real.log
+docker compose logs --tail=50 collect_worker
+docker compose logs --tail=50 oracle_annotation_worker
+docker compose logs --tail=50 data_worker
+docker compose logs --tail=50 train_worker
 ```
 
-O modo `feedback` é o mais indicado para uma demonstração rápida e segura, porque valida o loop de coleta, anotação simulada e reconstrução de dataset sem depender de rodar o treinamento completo ao vivo.
+O script também mostra automaticamente o estado das filas com:
+
+```bash
+docker exec mlops-rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+```
+
+Essa demonstração é o caminho recomendado para validar o projeto, porque reproduz o ciclo completo de MLOps: inferência, coleta de baixa confiança, anotação simulada, reconstrução de dataset, treinamento, avaliação, gate de qualidade e promoção automática do modelo.
 
 ---
+
 
 ## 10. Loop fechado demonstrado
 
@@ -1338,18 +1377,6 @@ uv run python src\tools\check_inference_status.py
 
 ```powershell
 uv run python src\tools\get_inference_result.py --inference-id inf-da3eb216
-```
-
-### Rodar demo guiada no Windows
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\demo_pipeline.ps1 -Mode feedback
-```
-
-### Rodar demo guiada no Linux/macOS
-
-```bash
-bash scripts/demo_pipeline.sh feedback
 ```
 
 ### Rodar workers reais manualmente

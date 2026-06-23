@@ -1230,20 +1230,75 @@ Depois, disparei um novo build sem criar nenhuma nova anotação oracle. Nesse c
 
 Esse comportamento está correto, porque não houve nova anotação desde o último build.
 
-Também criei scripts de demonstração guiada para facilitar a reprodução do projeto em outra máquina.
+Também avancei na containerização final do projeto com Docker Compose.
 
-Foram adicionados dois scripts:
+Até então, o Docker Compose era usado principalmente para subir o RabbitMQ. Na versão final, ajustei a composição para subir também todos os workers reais do pipeline:
 
 ```text
-scripts/demo_pipeline.ps1
-scripts/demo_pipeline.sh
+data_worker
+train_worker
+infer_worker
+collect_worker
+oracle_annotation_worker
 ```
 
-O primeiro é voltado para Windows PowerShell. O segundo é voltado para Linux/macOS.
+Durante essa etapa, percebi que colocar todas as dependências de treino na imagem comum dos workers deixava o build muito pesado. A primeira tentativa de incluir `ultralytics` diretamente nas dependências gerais fez o Docker baixar pacotes grandes relacionados a PyTorch e CUDA/NVIDIA, o que tornou a imagem pesada demais para a proposta.
 
-A ideia desses scripts é servir como alternativa a uma demonstração em vídeo, permitindo que outra pessoa execute uma demonstração rápida do fluxo principal diretamente no terminal.
+Para resolver isso, separei as imagens Docker em duas:
 
-O modo principal é o `feedback`, que demonstra o seguinte ciclo:
+```text
+Dockerfile         → imagem leve dos workers operacionais
+Dockerfile.train   → imagem dedicada do Train Worker
+```
+
+A imagem leve passou a instalar apenas as dependências necessárias para mensageria, inferência ONNX, validação de contratos e manipulação dos dados:
+
+```text
+uv sync --frozen --no-group train
+```
+
+Já a imagem de treino passou a instalar PyTorch CPU e Ultralytics de forma isolada:
+
+```text
+uv pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+uv pip install ultralytics
+```
+
+Com isso, os workers de dados, inferência, coleta e oracle continuam usando uma imagem mais leve, enquanto o `Train Worker real` usa uma imagem específica com as dependências de treinamento.
+
+Também ajustei o `docker-compose.yml` para usar:
+
+```text
+mlops-pipeline-workers:latest        → data_worker, infer_worker, collect_worker, oracle_annotation_worker
+mlops-pipeline-train-worker:latest   → train_worker
+```
+
+Além disso, atualizei o `.dockerignore` para evitar que diretórios pesados fossem enviados para o contexto de build, como:
+
+```text
+data/
+models/
+storage/
+runs/
+.venv/
+```
+
+Isso deixou o build mais previsível e reduziu o risco de enviar artefatos desnecessários para a imagem.
+
+Depois disso, substituí a ideia anterior de scripts de demonstração manual por scripts baseados no Docker Compose:
+
+```text
+scripts/demo_compose.ps1
+scripts/demo_compose.sh
+```
+
+A versão PowerShell foi validada com o comando:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\demo_compose.ps1 -WaitSeconds 120
+```
+
+Essa execução subiu o RabbitMQ e todos os workers reais via Docker Compose, publicou um evento de inferência com baixa confiança e demonstrou o ciclo completo:
 
 ```text
 q.infer.result
@@ -1253,98 +1308,64 @@ q.infer.result
 → data/raw recebe imagem + label anotados
 → q.data.build automático com trigger="feedback"
 → Data Worker real
+→ nova versão de dataset
 → q.train.run
+→ Train Worker real
+→ treino
+→ exportação ONNX
+→ avaliação
+→ gate de qualidade
+→ atualização de production.json
+→ q.model.promoted
 ```
 
-No script de Windows, os workers são abertos em janelas separadas de PowerShell. No script de Linux/macOS, os workers são iniciados em background e seus logs são salvos em:
+Durante a execução final, o `Collect Worker real` recebeu o evento de baixa confiança, validou `min_conf=0.3`, publicou uma tarefa em `q.label.task` e salvou o candidato em `storage/label_candidates`.
+
+O `Oracle Annotation Worker` consumiu a tarefa, recuperou o label verdadeiro no conjunto oracle, copiou imagem e rótulo para `data/raw`, registrou a anotação em `storage/oracle_annotations/annotations.jsonl` e publicou automaticamente um novo evento em `q.data.build`.
+
+O `Data Worker real` consumiu esse evento de feedback e criou o dataset versionado:
 
 ```text
-.demo_logs/
+ds-20260623-163531-7317eb
 ```
 
-Essa diferença deixa a demonstração mais adequada a cada ambiente. No Windows, a abertura de janelas facilita acompanhar visualmente os workers. No Linux, rodar em background com logs é mais robusto, porque não depende do terminal gráfico instalado.
-
-Também adicionei o arquivo:
+com as contagens:
 
 ```text
-.gitattributes
-```
-
-para garantir finais de linha adequados aos scripts:
-
-```text
-*.sh text eol=lf
-*.ps1 text eol=crlf
-```
-
-Com isso, o projeto passou a ter não apenas a documentação completa no README, mas também um caminho mais direto para executar uma demonstração reprodutível do loop de feedback.
-
-Depois de validar o script de demonstração, executei também o `Train Worker real` a partir do evento `q.train.run` gerado pelo Data Worker no loop de feedback.
-
-O evento consumido pelo Train Worker veio do dataset:
-
-```text
-ds-20260622-230918-d8f3ba
-```
-
-Esse dataset foi criado a partir de um evento:
-
-```text
-trigger="feedback"
-```
-
-e continha:
-
-```text
-train=67
-val=14
-test=14
+train=68
+val=15
+test=15
 added_this_cycle=1
 ```
 
-Isso confirmou que o treino foi disparado a partir de um dataset criado pelo ciclo automático de feedback.
-
-O Train Worker usou como checkpoint base o modelo vigente anterior:
+Em seguida, o `Train Worker real` consumiu `q.train.run`, executou o treino dentro do container Docker, exportou o modelo para ONNX, avaliou o modelo e obteve:
 
 ```text
-base_model=model-20260622-182157-34ab11
-```
-
-O novo treino obteve:
-
-```text
-TEST mAP50=0.8618
+TEST mAP50=0.8667
 Baseline mAP50=0.5000
 ```
 
-Como a métrica ficou acima do baseline, o modelo passou no gate de qualidade, foi registrado em:
+Como a métrica ficou acima do baseline, o modelo passou no gate de qualidade. O worker atualizou o ponteiro de produção:
 
 ```text
-storage/models/model-20260622-233122-64dae2
+storage/models/production.json
 ```
 
-e o ponteiro de produção foi atualizado.
-
-Em seguida, validei o estado do modelo ativo com:
-
-```powershell
-uv run python src\tools\check_inference_status.py
-```
-
-O comando retornou:
+registrou o novo modelo em:
 
 ```text
-status=healthy
-model_version=model-20260622-233122-64dae2
-model_file_exists=true
-dataset_version=ds-20260622-230918-d8f3ba
-mAP50=0.8618
-baseline=0.5
-base_model=model-20260622-182157-34ab11
-production_pointer_exists=true
+storage/models/model-20260623-163537-7347ce
 ```
 
-Essa validação fechou o ciclo completo: feedback, novo dataset, novo treino, gate de qualidade, promoção do modelo e atualização do modelo em produção.
+e publicou o evento em:
+
+```text
+q.model.promoted
+```
+
+No estado final das filas, `q.model.promoted` apareceu com uma mensagem pronta e zero consumidores. Isso é esperado nesta arquitetura, porque essa fila funciona como rastreabilidade da promoção, enquanto o estado operacional do modelo ativo é controlado por `production.json`.
+
+Essa validação confirmou que o projeto roda de ponta a ponta com Docker Compose, incluindo o `Train Worker real`, o gate de qualidade e a promoção automática do modelo.
 
 Os principais commits desta etapa foram:
 
@@ -1438,9 +1459,34 @@ Além disso, aprendi que a rastreabilidade do dataset não depende apenas de sal
 
 O campo `added_this_cycle` ajudou a deixar explícito quando o dataset cresceu de fato por causa da anotação simulada.
 
-Também aprendi a importância de fornecer um caminho de reprodução simples para outra pessoa testar o projeto. O README explica o funcionamento completo, mas os scripts de demonstração reduzem o atrito para validar o fluxo principal.
+Também aprendi a importância de fornecer um caminho de reprodução simples para outra pessoa testar o projeto.
 
-No Windows, faz sentido abrir os workers em janelas separadas, porque isso facilita acompanhar visualmente cada processo. No Linux/macOS, é mais robusto iniciar os workers em background e salvar logs em `.demo_logs/`, porque nem todo ambiente Linux possui o mesmo terminal gráfico.
+No início, pensei em scripts que subiriam partes do pipeline manualmente. Porém, a versão final ficou mais robusta ao usar Docker Compose como ponto único de execução. Assim, outra pessoa não precisa abrir workers manualmente nem gerenciar vários terminais. O Compose sobe RabbitMQ e todos os workers reais de uma vez.
+
+Também aprendi uma decisão importante de containerização: nem todos os serviços precisam usar a mesma imagem. No projeto, os workers operacionais não precisam carregar dependências pesadas de treinamento. Por isso, separar a imagem leve dos workers e a imagem específica do treino deixou a arquitetura mais limpa.
+
+A solução final ficou organizada assim:
+
+```text
+imagem leve:
+data_worker
+infer_worker
+collect_worker
+oracle_annotation_worker
+
+imagem de treino:
+train_worker
+```
+
+Esse desenho é mais próximo de um sistema real, porque serviços com responsabilidades diferentes podem ter ambientes de execução diferentes.
+
+Também aprendi que o Docker exige cuidado com o contexto de build. Enviar diretórios como `data/`, `storage/`, `runs/`, `models/` e `.venv/` para a imagem deixaria o build mais pesado, mais lento e menos reprodutível. O `.dockerignore` se tornou essencial para manter a imagem limpa.
+
+Outro aprendizado foi sobre dependências de ML. Instalar `ultralytics` sem cuidado pode puxar dependências grandes de PyTorch e CUDA. Para manter o ambiente mais controlado, instalei PyTorch CPU primeiro no `Dockerfile.train` e só depois instalei Ultralytics. Assim, o `Train Worker` consegue rodar dentro do Docker Compose sem forçar todos os workers a carregar esse custo.
+
+Também entendi melhor o valor de uma demo realmente fechada. A execução final não mostrou apenas mensagens circulando nas filas; ela demonstrou inferência, coleta, anotação simulada, reconstrução de dataset, treino, avaliação, gate de qualidade e promoção de modelo.
+
+Isso tornou a demonstração mais forte, porque o pipeline não termina em `q.train.run`; ele chega até `q.model.promoted` e atualiza o `production.json`.
 
 #### Decisões tomadas
 
@@ -1486,16 +1532,47 @@ Também decidi criar uma ferramenta simples de status da inferência, baseada no
 
 Por fim, decidi adicionar `metadata.json` nos datasets versionados e calcular `added_this_cycle` com base nas anotações oracle processadas. Isso melhorou a rastreabilidade entre anotação simulada, crescimento da fonte raw e criação de novos datasets.
 
-Também decidi criar dois scripts de demonstração guiada:
+Também decidi substituir os scripts antigos de demonstração manual por scripts baseados em Docker Compose:
 
 ```text
-scripts/demo_pipeline.ps1
-scripts/demo_pipeline.sh
+scripts/demo_compose.ps1
+scripts/demo_compose.sh
 ```
 
-A versão PowerShell atende ao ambiente Windows. A versão Bash atende Linux/macOS, que provavelmente é o ambiente mais comum para reprodução técnica do projeto.
+A versão PowerShell atende ao ambiente Windows. A versão Bash atende Linux/macOS.
 
-Também decidi que o modo principal dos scripts seria o `feedback`, porque ele demonstra o loop mais importante de forma rápida e segura, sem depender de rodar o treinamento completo ao vivo.
+A decisão foi fazer com que os scripts usassem o Compose como caminho principal de reprodução, em vez de iniciar workers manualmente. Assim, a demonstração fica mais próxima do ambiente final do projeto.
+
+Também decidi manter o `Train Worker real` dentro do Docker Compose. Para isso, separei as imagens Docker:
+
+```text
+Dockerfile         → workers leves
+Dockerfile.train   → Train Worker
+```
+
+Essa decisão evita instalar dependências pesadas de treino nos workers que não precisam delas, mas ainda permite que o pipeline rode de ponta a ponta via Compose.
+
+Também decidi que os scripts de demonstração deveriam validar o ciclo completo, não apenas o loop até `q.train.run`. A versão final demonstra:
+
+```text
+infer.result
+→ collect_worker
+→ label.task
+→ oracle_annotation_worker
+→ data.build
+→ data_worker
+→ train.run
+→ train_worker
+→ model.promoted
+```
+
+Por fim, mantive `q.model.promoted` como evento de rastreabilidade, sem exigir um consumidor ativo nessa fila. O estado operacional do modelo em produção continua sendo representado por:
+
+```text
+storage/models/production.json
+```
+
+Isso mantém a inferência desacoplada da fila de promoção e permite que o `Inference Worker real` descubra o modelo ativo mesmo que seja iniciado depois do treino.
 
 ---
 
@@ -1527,6 +1604,8 @@ q.data.build
 → novo ciclo
 ```
 
-Além da execução manual documentada no README, foram criados scripts de demonstração guiada para Windows e Linux/macOS, permitindo que o ciclo de feedback seja reproduzido de forma mais direta.
+Além da execução manual documentada no README, foram criados scripts de demonstração guiada baseados em Docker Compose para Windows e Linux/macOS. Esses scripts permitem reproduzir o ciclo completo do pipeline em uma única execução, incluindo inferência, coleta, anotação simulada, reconstrução do dataset, treino, avaliação, gate de qualidade e promoção automática do modelo.
 
-Com isso, o projeto atende ao objetivo principal: transformar scripts isolados de dados, treino e inferência em um pipeline reprodutível, rastreável e demonstrável de ponta a ponta.
+A versão final também inclui uma estratégia de containerização com duas imagens: uma imagem leve para os workers operacionais e uma imagem dedicada para o `Train Worker`, contendo PyTorch CPU e Ultralytics. Essa separação mantém a execução via Docker Compose completa, mas evita que todos os workers carreguem dependências pesadas de treinamento.
+
+Com isso, o projeto atende ao objetivo principal: transformar scripts isolados de dados, treino e inferência em um pipeline reprodutível, rastreável, containerizado e demonstrável de ponta a ponta.
