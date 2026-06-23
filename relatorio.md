@@ -2,15 +2,17 @@
 
 ## 1. Visão geral do problema
 
-A atividade consiste em transformar três scripts soltos de preparação de dados, treinamento e inferência em um pipeline de MLOps automatizado, orientado a mensagens.
+A atividade consiste em transformar três scripts isolados de preparação de dados, treinamento e inferência em um pipeline de MLOps automatizado, orientado a mensagens.
 
-O objetivo principal não é treinar o melhor modelo possível de uma vez, mas sim construir um ciclo de vida de modelo que consiga rodar de ponta a ponta:
+O objetivo principal não é treinar o melhor modelo possível em uma única execução, mas sim construir um ciclo de vida de modelo que consiga rodar de ponta a ponta:
 
 ```text
-dados → dataset versionado → treino → gate de qualidade → modelo promovido → inferência → coleta → novos dados → novo ciclo
+dados → dataset versionado → treino → gate de qualidade → modelo promovido → inferência → coleta → anotação simulada → novos dados → novo ciclo
 ```
 
-A solução é construída como um MVP, priorizando o ciclo completo funcionando, com rastreabilidade básica de datasets, modelos, runs de treino e inferências.
+A solução foi construída priorizando o ciclo completo funcionando, com rastreabilidade de datasets, modelos, execuções de treino e inferências.
+
+O pipeline final utiliza RabbitMQ para comunicação entre workers independentes, Pydantic para validação dos contratos de mensagem, versionamento local de datasets e modelos, gate de qualidade para promoção, inferência real com ONNX, coleta de baixa confiança e reincorporação automática de dados anotados ao ciclo.
 
 ---
 
@@ -20,7 +22,7 @@ Antes de implementar os workers, validei os scripts fornecidos manualmente para 
 
 ### 2.1 Script de dados — `src/prep_data.py`
 
-Responsabilidade atual:
+Responsabilidade:
 
 * lê a fonte raw em `data/raw`;
 * particiona os dados em treino, validação e teste;
@@ -34,7 +36,7 @@ data/raw
 data/classes.txt
 ```
 
-Saída principal:
+Saída inicial observada:
 
 ```text
 dataset/
@@ -47,19 +49,19 @@ dataset/labels/val
 dataset/labels/test
 ```
 
-Como esse script será usado no pipeline:
+Como esse script foi incorporado ao pipeline:
 
-* ele será a base do Worker de Dados;
-* o worker consumirá mensagens da fila `q.data.build`;
-* criará uma versão de dataset, como `ds-001`;
-* salvará metadados em JSON;
-* publicará uma mensagem na fila `q.train.run`.
+* passou a ser executado pelo `Data Worker real`;
+* o worker consome mensagens da fila `q.data.build`;
+* cria datasets versionados em `storage/datasets`;
+* salva metadados em `metadata.json`;
+* publica uma mensagem na fila `q.train.run`.
 
 ---
 
 ### 2.2 Script de treino — `src/train.py`
 
-Responsabilidade atual:
+Responsabilidade:
 
 * recebe um dataset preparado;
 * recebe um checkpoint base;
@@ -82,20 +84,21 @@ runs/smoke_test/weights/best.onnx
 runs/smoke_test/weights/last.pt
 ```
 
-Como esse script será usado no pipeline:
+Como esse script foi incorporado ao pipeline:
 
-* ele será a base do Worker de Treino;
-* o worker consumirá mensagens da fila `q.train.run`;
-* treinará um modelo candidato;
-* aplicará o gate de qualidade;
-* registrará modelos promovidos e não promovidos;
-* publicará `q.model.promoted` apenas se o modelo passar no gate.
+* passou a ser executado pelo `Train Worker real`;
+* o worker consome mensagens da fila `q.train.run`;
+* treina um modelo candidato;
+* aplica o gate de qualidade;
+* registra o modelo versionado;
+* atualiza `storage/models/production.json` quando o modelo passa no gate;
+* publica `q.model.promoted` apenas se o modelo for aprovado.
 
 ---
 
 ### 2.3 Script de inferência — `src/infer.py`
 
-Responsabilidade atual:
+Responsabilidade:
 
 * carrega um modelo ONNX;
 * recebe uma imagem;
@@ -118,33 +121,34 @@ RBC conf=0.83 box=[78, 330, 173, 433]
 ...
 ```
 
-Como esse script será usado no pipeline:
+Como esse script foi incorporado ao pipeline:
 
-* ele será a base do Worker de Inferência;
-* o worker consumirá mensagens da fila `q.infer.request`;
-* gerará um `inference_id`;
-* salvará o resultado por `inference_id`;
-* publicará `q.infer.result`;
-* o mesmo evento será usado como resultado da inferência e como entrada para o Worker de Coleta.
+* passou a ser executado pelo `Inference Worker real`;
+* o worker consome mensagens da fila `q.infer.request`;
+* usa o modelo ativo apontado por `storage/models/production.json`;
+* gera um `inference_id`;
+* salva o resultado em `storage/inference_results/results.jsonl`;
+* publica `q.infer.result`;
+* o resultado publicado é consumido pelo `Collect Worker real`.
 
 ---
 
-## 3. Decisões iniciais de arquitetura
+## 3. Decisões de arquitetura
 
 ### 3.1 Versionamento local com JSON
 
 Decisão:
 
-Usar pastas locais e arquivos JSON para guardar versões de datasets, modelos, execuções de treino e inferências.
+Usar pastas locais e arquivos JSON para guardar versões de datasets, modelos, execuções de treino, inferências e metadados.
 
 Justificativa:
 
-Essa abordagem mantém a solução simples e fácil de inspecionar. Como o foco inicial é fazer o ciclo completo funcionar, preferi começar com uma estrutura local antes de adicionar ferramentas ou serviços mais complexos.
+Essa abordagem mantém a solução simples, rastreável e fácil de inspecionar. Como o objetivo principal é demonstrar o ciclo completo funcionando, uma estrutura local foi suficiente para validar o pipeline sem adicionar dependências externas como MLflow, DVC ou storage de objetos.
 
 Trade-off:
 
 * Vantagem: simples, fácil de entender, fácil de testar e suficiente para validar o pipeline.
-* Desvantagem: em um cenário maior, essa organização poderia precisar ser substituída por uma solução mais robusta.
+* Desvantagem: em um cenário maior, essa organização poderia ser substituída por uma solução mais robusta.
 
 ---
 
@@ -152,97 +156,134 @@ Trade-off:
 
 Decisão:
 
-Quando um modelo candidato não superar o baseline, ele será registrado como uma run válida, mas com status de não promovido.
+Quando um modelo candidato não supera o baseline, ele é tratado como uma execução válida, mas não é promovido.
 
 Justificativa:
 
-Um treino que não passa no gate é um resultado esperado do pipeline, não uma falha técnica. Ele deve ser salvo para manter histórico e rastreabilidade.
+Um treino que não passa no gate é um resultado esperado do pipeline, não uma falha técnica. Ele deve ser registrado para manter histórico e rastreabilidade.
 
 Trade-off:
 
-* Vantagem: preserva histórico completo das tentativas de treino.
-* Desvantagem: exige manter metadados também para modelos que não serão usados em produção.
+* Vantagem: separa falha técnica de resultado ruim de modelo.
+* Desvantagem: exige manter metadados também para execuções que não geram um modelo em produção.
 
 ---
 
-### 3.3 Atualização simples do modelo de inferência
+### 3.3 Ponteiro operacional do modelo em produção
 
 Decisão:
 
-O Worker de Inferência consultará um arquivo local, como `current_model.json`, antes de cada inferência. Se a versão de produção tiver mudado, ele recarregará o modelo.
+O `Inference Worker real` consulta o arquivo local:
+
+```text
+storage/models/production.json
+```
+
+antes de cada inferência. Se a versão de produção tiver mudado, ele recarrega o modelo ONNX ativo.
 
 Justificativa:
 
-Essa estratégia é simples e adequada para o MVP. Ela permite que o Worker de Inferência use sempre o modelo marcado como produção, sem criar uma lógica de atualização mais complexa neste primeiro momento.
+Essa estratégia reduz o acoplamento entre treino e inferência. O evento `q.model.promoted` continua existindo como registro de promoção, mas o estado operacional do modelo ativo fica centralizado no `production.json`.
+
+Assim, o `Inference Worker real` não depende de estar rodando no momento exato em que o `Train Worker real` publica `q.model.promoted`. Mesmo que o worker de inferência seja iniciado depois, ele consegue descobrir qual modelo está ativo consultando o ponteiro de produção.
 
 Trade-off:
 
-* Vantagem: simples de implementar e fácil de explicar.
-* Desvantagem: a atualização do modelo ocorre na próxima inferência, não exatamente no momento em que o modelo é promovido.
+* Vantagem: simples, rastreável e desacoplado da fila de promoção.
+* Desvantagem: a atualização do modelo ocorre quando o worker consulta o ponteiro, e não por uma notificação direta em tempo real.
 
 ---
 
-## 4. Arquitetura planejada
+### 3.4 Separação entre coleta, anotação e reconstrução do dataset
 
-A solução será organizada em workers independentes, comunicando-se por RabbitMQ. O pipeline possui dois fluxos principais: o fluxo de dados/treino e o fluxo de inferência/coleta.
+Decisão:
+
+O `Collect Worker real` não publica `q.data.build` diretamente. Ele apenas seleciona casos de baixa confiança e publica tarefas de anotação em:
+
+```text
+q.label.task
+```
+
+O novo build de dataset é publicado pelo `Oracle Annotation Worker`, depois que a imagem e o label verdadeiro foram reinjetados em:
+
+```text
+data/raw
+```
+
+Justificativa:
+
+Baixa confiança ainda não significa novo dado pronto para treino. Ela apenas indica que aquele caso deve ser analisado e anotado. O dataset só deve ser reconstruído depois que existe um novo exemplo anotado disponível na fonte `raw`.
+
+Trade-off:
+
+* Vantagem: mantém responsabilidades claras e evita rebuild precipitado a cada baixa confiança.
+* Desvantagem: adiciona uma etapa extra ao fluxo, exigindo um worker específico para a anotação simulada.
+
+---
+
+## 4. Arquitetura final
+
+A solução é organizada em workers independentes, comunicando-se por RabbitMQ. O pipeline possui dois fluxos principais: o fluxo de dados/treino e o fluxo de inferência/coleta/anotação.
 
 Fluxo de dados e treino:
 
 ```text
 q.data.build
     ↓
-Worker de Dados
+Data Worker real
     ↓
 q.train.run
     ↓
-Worker de Treino
+Train Worker real
     ↓
-q.model.promoted
+gate de qualidade
     ↓
-Registro/atualização do modelo de produção
+production.json + q.model.promoted se aprovado
 ```
 
-Fluxo de inferência e coleta:
+Fluxo de inferência, coleta e anotação simulada:
 
 ```text
 q.infer.request
     ↓
-Worker de Inferência
+Inference Worker real
     ↓
 q.infer.result
     ↓
-Worker de Coleta
+Collect Worker real
     ↓
-q.label.task + q.data.build
+q.label.task
+    ↓
+Oracle Annotation Worker
+    ↓
+data/raw cresce
+    ↓
+q.data.build com trigger="feedback"
 ```
 
-A ideia é que o Worker de Treino registre o modelo candidato e, caso ele passe no gate de qualidade, atualize a versão de produção. O Worker de Inferência, por sua vez, atende requisições de inferência usando a versão atual de produção do modelo.
+Cada worker tem uma responsabilidade clara:
 
-Cada worker terá uma responsabilidade clara:
-
-| Worker               | Consome           | Produz                          | Responsabilidade                                                                  |
-| -------------------- | ----------------- | ------------------------------- | --------------------------------------------------------------------------------- |
-| Worker de Dados      | `q.data.build`    | `q.train.run`                   | Criar dataset versionado a partir da fonte raw                                    |
-| Worker de Treino     | `q.train.run`     | `q.model.promoted` se aprovado  | Treinar modelo candidato, avaliar e aplicar gate                                  |
-| Worker de Inferência | `q.infer.request` | `q.infer.result`                | Rodar inferência com o modelo atual de produção                                   |
-| Worker de Coleta     | `q.infer.result`  | `q.label.task` e `q.data.build` | Coletar casos de baixa confiança, simular anotação e disparar novo ciclo de dados |
-
+| Worker                   | Consome           | Produz                         | Responsabilidade                                                               |
+| ------------------------ | ----------------- | ------------------------------ | ------------------------------------------------------------------------------ |
+| Data Worker real         | `q.data.build`    | `q.train.run`                  | Criar dataset versionado a partir da fonte raw                                 |
+| Train Worker real        | `q.train.run`     | `q.model.promoted` se aprovado | Treinar modelo candidato, avaliar, aplicar gate e atualizar produção           |
+| Inference Worker real    | `q.infer.request` | `q.infer.result`               | Rodar inferência com o modelo ativo em produção                                |
+| Collect Worker real      | `q.infer.result`  | `q.label.task`                 | Selecionar casos de baixa confiança e criar tarefas de anotação                |
+| Oracle Annotation Worker | `q.label.task`    | `q.data.build`                 | Simular anotação, reinjetar imagem + label em `data/raw` e disparar novo build |
 
 ---
 
 ## 5. Estratégia de implementação
 
-O foco é construir um pipeline de MLOps funcional, orientado a mensagens, com RabbitMQ, workers independentes, versionamento básico de datasets/modelos, gate de qualidade e fechamento do ciclo de coleta. A prioridade é garantir que o ciclo principal funcione de ponta a ponta por mensageria.
+A implementação foi feita de forma incremental, começando pela validação dos scripts base, depois pela mensageria com workers fake, depois pelos workers reais de dados e treino, e por fim pelo fechamento do loop com inferência, coleta, anotação simulada e rastreabilidade.
 
-A implementação será feita de forma incremental, em três etapas internas.
-
-### Etapa 1 — Esqueleto de mensageria
+### 5.1 Esqueleto de mensageria
 
 Objetivo:
 
 Validar a comunicação entre os serviços antes de integrar a lógica real dos scripts.
 
-Tarefas:
+Tarefas realizadas:
 
 * subir RabbitMQ com Docker Compose;
 * criar as filas principais do pipeline;
@@ -258,84 +299,67 @@ Fluxos testados nesta etapa:
 q.data.build → Data Worker fake → q.train.run
 q.train.run → Train Worker fake → q.model.promoted
 q.infer.request → Infer Worker fake → q.infer.result
-q.infer.result → Collect Worker fake → q.label.task + q.data.build
 ```
 
-Critério de pronto:
+Na primeira versão fake, o fluxo de coleta ainda simulava a publicação de `q.label.task` e `q.data.build`. Depois, esse desenho foi corrigido: o `Collect Worker` passou a criar apenas `q.label.task`, e o disparo de `q.data.build` ficou no `Oracle Annotation Worker`, após a anotação simulada.
 
-O pipeline fake deve provar que os eventos conseguem circular entre as filas principais, que os workers conseguem consumir e publicar mensagens, e que o ciclo de coleta consegue gerar um novo evento `q.data.build`.
+Critério validado:
+
+O pipeline fake provou que os eventos conseguiam circular entre as filas principais, que os workers conseguiam consumir e publicar mensagens, e que o RabbitMQ mantinha mensagens disponíveis até que o próximo consumidor fosse executado.
 
 ---
 
-### Etapa 2 — Dados e treino reais
+### 5.2 Dados e treino reais
 
 Objetivo:
 
 Substituir os workers fake de dados e treino por workers reais, reaproveitando os scripts `prep_data.py` e `train.py`.
 
-Tarefas:
+Tarefas realizadas:
 
-* transformar a lógica de `prep_data.py` em um Data Worker real;
+* implementar `data_worker_real.py`;
 * consumir mensagens da fila `q.data.build`;
-* criar datasets versionados, como `ds-001`, `ds-002`, etc.;
-* salvar metadados do dataset em JSON;
+* criar datasets versionados em `storage/datasets`;
+* salvar metadados do dataset em `metadata.json`;
 * publicar eventos reais em `q.train.run`;
-* transformar a lógica de `train.py` em um Train Worker real;
+* implementar `train_worker_real.py`;
 * treinar um modelo candidato a partir do dataset versionado;
 * avaliar o modelo no conjunto de teste;
-* aplicar um gate de qualidade;
-* registrar runs de treino promovidas e não promovidas;
-* atualizar o modelo de produção quando o candidato superar o baseline.
+* aplicar gate de qualidade;
+* registrar modelos promovidos;
+* atualizar o modelo de produção quando o candidato supera o baseline.
 
-Critério de pronto:
+Critério validado:
 
-A partir de uma mensagem em `q.data.build`, o sistema deve criar um dataset versionado, disparar um treino real, avaliar o modelo candidato e registrar se ele foi promovido ou não.
+A partir de uma mensagem em `q.data.build`, o sistema conseguiu criar um dataset versionado, disparar um treino real, avaliar o modelo candidato e registrar sua promoção quando o gate de qualidade foi superado.
 
 ---
 
-### Etapa 3 — Inferência, coleta e loop fechado reais
+### 5.3 Inferência, coleta, anotação simulada e loop fechado
 
 Objetivo:
 
 Substituir os workers fake de inferência e coleta por workers reais, reaproveitando o script `infer.py` e implementando a lógica de seleção de casos para anotação simulada.
 
-Tarefas:
+Tarefas realizadas:
 
-* transformar a lógica de `infer.py` em um Infer Worker real;
+* implementar `infer_worker_real.py`;
 * consumir mensagens da fila `q.infer.request`;
-* carregar o modelo de produção;
+* carregar o modelo ativo em produção;
 * gerar um `inference_id` único para cada inferência;
 * salvar os resultados de inferência;
 * publicar eventos em `q.infer.result`;
-* criar um Collect Worker real;
+* implementar `collect_worker_real.py`;
 * selecionar casos de baixa confiança;
 * gerar tarefas de anotação em `q.label.task`;
+* implementar `oracle_annotation_worker.py`;
 * usar os labels do oracle para simular anotação;
 * reincorporar imagem e label à fonte raw;
-* publicar um novo evento em `q.data.build`.
+* publicar automaticamente um novo evento em `q.data.build` com `trigger="feedback"`.
 
-Critério de pronto:
+Critério validado:
 
-Uma imagem enviada para inferência deve gerar um resultado rastreável por `inference_id`. Caso a predição tenha baixa confiança, o sistema deve simular a anotação, reincorporar o dado à fonte raw e disparar um novo ciclo de preparação de dataset.
-
----
-
-### Critério geral de sucesso
-
-O projeto será considerado funcional quando o pipeline conseguir executar o ciclo principal:
-
-```text
-dados → dataset versionado → treino → gate de qualidade → modelo promovido → inferência → coleta → novos dados → novo ciclo
-```
-
-Além disso, deve ser possível rastrear:
-
-* qual dataset foi usado para treinar cada modelo;
-* qual modelo está em produção;
-* quais métricas justificaram a promoção ou rejeição de um modelo;
-* qual modelo gerou cada inferência;
-* quais inferências foram selecionadas para coleta.
-
+Uma imagem enviada para inferência gerou um resultado rastreável por `inference_id`. Quando a predição teve baixa confiança, o sistema criou uma tarefa de anotação, simulou a anotação usando o oráculo, reincorporou o dado à fonte `raw` e disparou automaticamente um novo ciclo de preparação de dataset.
 
 ---
 
@@ -355,8 +379,9 @@ Resultado observado:
 
 O script de preparação de dados funcionou corretamente e gerou a estrutura de dataset no formato YOLO, incluindo o arquivo `dataset/data.yaml` e as divisões de treino, validação e teste.
 
-Essa etapa confirmou que os dados em `data/raw` conseguem ser transformados em um dataset utilizável pelo script de treino.
+Essa etapa confirmou que os dados em `data/raw` conseguiam ser transformados em um dataset utilizável pelo script de treino.
 
+---
 
 ### 6.2 Inferência
 
@@ -369,6 +394,8 @@ uv run python src/infer.py --model models\v0\best.onnx --image data\stream\image
 Resultado observado:
 
 O modelo carregou corretamente e retornou detecções com classe, confiança e bounding box. A menor confiança observada foi baixa o suficiente para servir como exemplo de coleta por baixa confiança no Worker de Coleta.
+
+---
 
 ### 6.3 Treino curto
 
@@ -388,7 +415,7 @@ runs/smoke_test/weights/best.onnx
 runs/smoke_test/weights/last.pt
 ```
 
-Essa validação mostrou que o ambiente está configurado corretamente e que os scripts base funcionam antes da integração com RabbitMQ.
+Essa validação mostrou que o ambiente estava configurado corretamente e que os scripts base funcionavam antes da integração com RabbitMQ.
 
 ---
 
@@ -397,28 +424,38 @@ Essa validação mostrou que o ambiente está configurado corretamente e que os 
 ### 17/06/2026 — Validação do baseline
 
 #### O que fiz
-- Rodei os scripts base manualmente.
-- Validei `prep_data.py`, `train.py` e `infer.py`.
+
+Rodei manualmente os scripts base:
+
+```text
+src/prep_data.py
+src/train.py
+src/infer.py
+```
+
+Validei que o script de dados gerava um dataset no formato YOLO, que o treino produzia artefatos `.pt` e `.onnx`, e que o script de inferência conseguia carregar um modelo ONNX e retornar detecções estruturadas.
 
 #### O que aprendi
-- O treino usa `.pt`.
-- A inferência usa `.onnx`.
-- O `infer.py` já retorna detecções estruturadas.
+
+Aprendi que o treino usa o checkpoint em formato `.pt`, enquanto a inferência utiliza o modelo exportado em formato `.onnx`.
+
+Também observei que o `infer.py` já retornava informações suficientes para o restante do pipeline, como classe, confiança e bounding box.
 
 #### Decisões tomadas
-- Decidi manter versionamento local com JSON no MVP.
-- Decidi tratar modelo reprovado no gate como run válida não promovida.
 
-#### Próximo passo
-- Subir RabbitMQ e criar workers mínimos.
+Decidi manter versionamento local com JSON e pastas versionadas, porque essa abordagem seria suficiente para validar o ciclo de ponta a ponta.
+
+Também decidi tratar modelo reprovado no gate como uma execução válida não promovida, e não como erro técnico.
+
+---
 
 ### 18/06/2026 — Validação da mensageria e testes de publisher/consumer
 
 #### O que fiz
 
-Nesta etapa, concluí a Entrega 1, focada em validar a mensageria do pipeline antes de começar a transformar os scripts reais em workers.
+Nesta etapa, validei a mensageria do pipeline antes de transformar os scripts reais em workers.
 
-Primeiro, subi o RabbitMQ usando Docker Compose e confirmei que o container estava rodando corretamente com status `healthy`. Depois, criei as principais filas que serão usadas no pipeline:
+Primeiro, subi o RabbitMQ usando Docker Compose e confirmei que o container estava rodando corretamente. Depois, criei as principais filas usadas no pipeline:
 
 ```text
 q.data.build
@@ -429,7 +466,7 @@ q.infer.result
 q.label.task
 ```
 
-Em seguida, criei publishers e workers fake para testar a comunicação entre as etapas do pipeline.
+Em seguida, criei publishers e workers fake para testar a comunicação entre as etapas.
 
 Validei primeiro o fluxo de dados para treino:
 
@@ -449,15 +486,15 @@ Também testei a parte de inferência:
 q.infer.request → Infer Worker fake → q.infer.result
 ```
 
-Por fim, validei a etapa de coleta:
+Por fim, validei a etapa de coleta em uma primeira versão fake:
 
 ```text
 q.infer.result → Collect Worker fake → q.label.task + q.data.build
 ```
 
-Com isso, consegui simular o loop principal do pipeline: uma mensagem gera a próxima etapa, e o Collect Worker fake consegue simular uma coleta por baixa confiança, criar uma tarefa de anotação e disparar um novo ciclo de dados.
+Essa versão inicial ajudou a entender o loop de feedback, mas depois foi ajustada para separar melhor as responsabilidades. O `Collect Worker` passou a publicar apenas `q.label.task`, e o disparo de `q.data.build` foi movido para o `Oracle Annotation Worker`, depois da anotação simulada.
 
-Além dos workers fake, também fiz os testes sugeridos a partir do feedback técnico recebido para entender melhor o funcionamento básico de um publisher e de um consumer.
+Além dos workers fake, também fiz testes simples de publisher e consumer para entender melhor o funcionamento básico do RabbitMQ.
 
 Criei uma fila simples chamada:
 
@@ -465,7 +502,7 @@ Criei uma fila simples chamada:
 q.example.dataset
 ```
 
-Depois criei um publisher simples que envia uma mensagem JSON com os parâmetros necessários para criação de um dataset. A mensagem usada tinha este formato:
+Depois criei um publisher que enviava uma mensagem JSON com os parâmetros necessários para criação de um dataset:
 
 ```json
 {
@@ -507,7 +544,7 @@ test_frac = message["params"]["test_frac"]
 seed = message["params"]["seed"]
 ```
 
-Depois de processar a mensagem, o consumer enviou o `ack`, confirmando ao RabbitMQ que a mensagem foi processada com sucesso. Ao verificar as filas, confirmei que `q.example.dataset` ficou com zero mensagens pendentes, ou seja, o publisher enviou, a fila armazenou, o consumer consumiu e o RabbitMQ removeu a mensagem após o processamento.
+Depois de processar a mensagem, o consumer enviou o `ack`, confirmando ao RabbitMQ que a mensagem foi processada com sucesso. Ao verificar as filas, confirmei que `q.example.dataset` ficou com zero mensagens pendentes.
 
 #### O que aprendi
 
@@ -515,13 +552,13 @@ Aprendi melhor como o RabbitMQ organiza a comunicação entre serviços. Em vez 
 
 Também entendi melhor alguns conceitos importantes:
 
-* Um **publisher** é o processo que envia uma mensagem para uma fila.
-* Um **consumer** é o processo que lê mensagens de uma fila.
-* Um **worker** é um tipo de consumer que, além de ler a mensagem, executa uma tarefa do pipeline.
-* Uma **fila** armazena mensagens até que algum consumer as processe.
-* O **ack** é a confirmação enviada pelo consumer ao RabbitMQ dizendo que a mensagem foi processada com sucesso.
-* Uma mensagem em **JSON** pode ser enviada como string e depois convertida para dicionário Python com `json.loads`.
-* Um **worker fake** é uma versão provisória do worker real. Ele ainda não executa a lógica pesada, mas simula o comportamento esperado para validar o fluxo.
+* um publisher é o processo que envia uma mensagem para uma fila;
+* um consumer é o processo que lê mensagens de uma fila;
+* um worker é um tipo de consumer que, além de ler a mensagem, executa uma tarefa do pipeline;
+* uma fila armazena mensagens até que algum consumer as processe;
+* o `ack` é a confirmação enviada pelo consumer ao RabbitMQ dizendo que a mensagem foi processada com sucesso;
+* uma mensagem JSON pode ser enviada como string e depois convertida para dicionário Python com `json.loads`;
+* um worker fake é uma versão provisória do worker real, usada para validar o fluxo sem executar a lógica pesada.
 
 Também observei que o RabbitMQ mantém mensagens paradas quando ainda não existe consumidor para uma fila. Isso aconteceu, por exemplo, quando uma mensagem ficou em `q.train.run` até o Train Worker fake ser executado.
 
@@ -543,28 +580,19 @@ Com os testes isolados, consegui validar uma camada por vez:
 * depois, o `ack`;
 * por fim, os workers fake simulando o fluxo do pipeline.
 
-O trade-off é que essa etapa ainda não executa o pipeline real de ML, porque os workers fake apenas simulam o comportamento. Mesmo assim, ela cria uma base mais segura para substituir gradualmente o comportamento fake pela lógica real de `prep_data.py`, `train.py` e `infer.py`.
+Essa etapa ainda não executava o pipeline real de ML, porque os workers fake apenas simulavam o comportamento. Mesmo assim, ela criou uma base mais segura para substituir gradualmente o comportamento fake pela lógica real de `prep_data.py`, `train.py` e `infer.py`.
 
-Com isso, considero a Entrega 1 concluída: o esqueleto de mensageria foi validado tanto com um exemplo simples de publisher/consumer quanto com workers fake representando as etapas principais do pipeline.
-
-#### Próximo passo
-
-O próximo passo é começar a substituir o Data Worker fake por um Data Worker real.
-
-Esse worker deverá consumir mensagens da fila `q.data.build`, converter a mensagem JSON em dicionário Python, extrair parâmetros como `raw_uri`, `val_frac`, `test_frac` e `seed`, executar a lógica de preparação de dados, criar uma versão de dataset como `ds-001`, salvar metadados dessa versão e publicar um evento real em `q.train.run`.
-
-Depois disso, o próximo avanço será transformar o Train Worker fake em um Train Worker real, usando o script de treino, registrando métricas e aplicando o gate de qualidade.
-
+---
 
 ### 19/06/2026 — Padronização dos workers e início dos workers reais
 
 #### O que fiz
 
-Nesta etapa, incorporei os feedbacks recebidos na daily anterior e comecei a substituir partes do pipeline fake por workers reais.
+Nesta etapa, incorporei feedbacks técnicos e comecei a substituir partes do pipeline fake por workers reais.
 
-Primeiro, ajustei a lógica do `Collect Worker fake`. Na versão anterior, quando uma inferência tinha baixa confiança, o worker publicava automaticamente uma nova mensagem em `q.data.build`, iniciando um novo ciclo de construção de dataset. Depois do feedback técnico recebido, alterei esse comportamento.
+Primeiro, ajustei a lógica do `Collect Worker fake`. Na versão anterior, quando uma inferência tinha baixa confiança, o worker publicava automaticamente uma nova mensagem em `q.data.build`, iniciando um novo ciclo de construção de dataset.
 
-Agora, o `collect_worker_fake.py` apenas registra o caso como candidato para anotação e publica uma mensagem em:
+Depois do feedback técnico recebido, alterei esse comportamento. O `collect_worker_fake.py` passou a registrar o caso como candidato para anotação e publicar apenas uma mensagem em:
 
 ```text
 q.label.task
@@ -576,7 +604,7 @@ O worker também salva localmente o candidato em:
 storage/label_candidates/candidates.jsonl
 ```
 
-Com isso, o rebuild do dataset não acontece mais automaticamente a cada baixa confiança. A reconstrução do dataset passa a ser uma etapa posterior, manual ou em lote, o que torna o fluxo mais realista.
+Naquele momento, a reconstrução do dataset passou a ser uma etapa posterior ao Collect Worker. Essa decisão evitou reconstruir o dataset imediatamente após qualquer baixa confiança. Depois, no fechamento do loop, o disparo automático de `q.data.build` foi movido para o `Oracle Annotation Worker`, ou seja, apenas depois que a anotação simulada realmente reinjeta imagem e label em `data/raw`.
 
 Depois disso, implementei a sugestão de modularizar a parte repetida do RabbitMQ. Criei um módulo comum chamado:
 
@@ -627,7 +655,7 @@ infer_worker_fake.py
 collect_worker_fake.py
 ```
 
-Com isso, todos os workers fake passaram a ter uma estrutura mais consistente:
+Com isso, todos os workers fake passaram a ter uma estrutura consistente:
 
 ```text
 mensagem RabbitMQ
@@ -640,7 +668,7 @@ mensagem RabbitMQ
 
 Depois de padronizar os workers fake, comecei a implementar os workers reais.
 
-O primeiro foi o:
+O primeiro foi:
 
 ```text
 src/workers/data_worker_real.py
@@ -672,7 +700,7 @@ Depois disso, o `data_worker_real.py` publicou um evento real em:
 q.train.run
 ```
 
-Em seguida, implementei o:
+Em seguida, implementei:
 
 ```text
 src/workers/train_worker_real.py
@@ -720,7 +748,7 @@ Também validei o fluxo integrado entre os dois workers reais já implementados:
 q.data.build → Data Worker real → q.train.run → Train Worker real → q.model.promoted
 ```
 
-Esse teste mostrou que o pipeline já consegue sair de uma mensagem de construção de dataset, criar um dataset versionado, iniciar um treino real, aplicar o gate de qualidade e promover um modelo aprovado.
+Esse teste mostrou que o pipeline já conseguia sair de uma mensagem de construção de dataset, criar um dataset versionado, iniciar um treino real, aplicar o gate de qualidade e promover um modelo aprovado.
 
 #### O que aprendi
 
@@ -732,14 +760,15 @@ Com o helper comum em `src/messaging/rabbitmq.py`, os workers ficaram mais simpl
 
 * o Data Worker prepara e versiona datasets;
 * o Train Worker treina, avalia e aplica o gate de qualidade;
-* o Infer Worker simula ou executa inferência;
-* o Collect Worker seleciona casos para anotação.
+* o Inference Worker executa inferência;
+* o Collect Worker seleciona casos para anotação;
+* o Oracle Annotation Worker simula a anotação e fecha o loop de feedback.
 
 Também aprendi melhor o papel do Pydantic em um sistema orientado a mensagens. Em vez de confiar que todo dicionário recebido terá o formato correto, agora o worker valida explicitamente o contrato da mensagem antes de processá-la.
 
 Isso ajuda a evitar erros silenciosos. Por exemplo, se uma mensagem `data.build` vier sem `raw_uri` ou com `val_frac` inválido, o erro aparece logo na entrada do worker, antes de executar qualquer lógica mais pesada.
 
-Outro aprendizado importante foi sobre o gate de qualidade. O modelo treinado pode ser considerado uma run válida mesmo que não seja promovido. A promoção só acontece se a métrica superar o baseline definido. Isso separa duas ideias diferentes:
+Outro aprendizado importante foi sobre o gate de qualidade. O modelo treinado pode ser considerado uma execução válida mesmo que não seja promovido. A promoção só acontece se a métrica superar o baseline definido. Isso separa duas ideias diferentes:
 
 ```text
 treinar um modelo
@@ -768,41 +797,17 @@ Também decidi manter os workers fake no projeto. Eles continuam úteis para tes
 
 Outra decisão foi criar os workers reais de forma incremental. Primeiro implementei o `data_worker_real.py`, depois o `train_worker_real.py`. Isso permitiu testar o fluxo por partes e identificar problemas mais facilmente.
 
-Também decidi manter o gate de qualidade no Train Worker real. O worker só publica `q.model.promoted` se o modelo passar no critério mínimo definido. Caso contrário, o treino ainda seria uma run válida, mas sem promoção do modelo.
+Também decidi manter o gate de qualidade no Train Worker real. O worker só publica `q.model.promoted` se o modelo passar no critério mínimo definido. Caso contrário, o treino ainda seria uma execução válida, mas sem promoção do modelo.
 
-Por fim, decidi manter o `q.data.build` fora do disparo automático do Collect Worker. O Collect Worker agora apenas cria tarefas de anotação e salva candidatos. A reconstrução do dataset deverá acontecer em uma etapa posterior, quando houver dados anotados suficientes.
+Por fim, decidi manter o `q.data.build` fora do disparo automático do Collect Worker. O Collect Worker agora apenas cria tarefas de anotação e salva candidatos. O novo build de dataset passou a depender da existência real de dados anotados.
 
-Com isso, considero a Entrega 2 concluída. A etapa atual já demonstra a evolução do pipeline de um esqueleto fake de mensageria para uma estrutura mais organizada, com contratos de mensagens, helper comum de RabbitMQ e workers reais para dados e treino.
-
-#### Próximo passo
-
-O próximo passo será iniciar a Entrega 3.
-
-A prioridade será implementar o `Inference Worker real`, conectando o modelo promovido ao fluxo real de inferência. Esse worker deverá consumir mensagens de:
-
-```text
-q.infer.request
-```
-
-executar inferência com o modelo ONNX ativo e publicar os resultados em:
-
-```text
-q.infer.result
-```
-
-Depois disso, o próximo avanço será transformar o fluxo de coleta em uma etapa mais real, conectando os resultados de inferência ao processo de seleção de exemplos de baixa confiança e preparação para anotação.
-
-Com isso, o objetivo será fechar melhor o ciclo:
-
-```text
-dados → treino → promoção → inferência → coleta → anotação → novos dados
-```
+---
 
 ### 22/06/2026 — Fechamento do ciclo real de inferência, coleta, anotação simulada e rastreabilidade
 
 #### O que fiz
 
-Nesta etapa, avancei na Entrega 3 com o objetivo de fechar o ciclo real do pipeline de MLOps depois da promoção do modelo.
+Nesta etapa, avancei no fechamento do ciclo real do pipeline de MLOps depois da promoção do modelo.
 
 Na etapa anterior, o pipeline já possuía os workers reais de dados e treino funcionando:
 
@@ -845,7 +850,7 @@ updated_at
 
 A partir disso, o serviço de inferência não precisa depender diretamente do evento `q.model.promoted` para saber qual modelo deve usar. O evento continua existindo como registro da promoção, mas a referência operacional do modelo ativo passa a ser o `production.json`.
 
-Depois disso, implementei o:
+Depois disso, implementei:
 
 ```text
 src/workers/infer_worker_real.py
@@ -899,7 +904,7 @@ inf-da3eb216
 
 com `min_conf` abaixo do limite definido, o que permitiu testar a etapa de coleta.
 
-Em seguida, implementei o:
+Em seguida, implementei:
 
 ```text
 src/workers/collect_worker_real.py
@@ -941,15 +946,15 @@ e copiou a imagem candidata para:
 storage/label_candidates/images/
 ```
 
-Mantive a decisão de o `Collect Worker real` não disparar `q.data.build` automaticamente. Ele apenas seleciona o caso incerto e cria a tarefa de anotação. A reconstrução do dataset continua sendo uma etapa posterior.
+Mantive a decisão de o `Collect Worker real` não disparar `q.data.build` diretamente. Ele apenas seleciona o caso incerto e cria a tarefa de anotação.
 
-Depois disso, implementei o:
+Depois disso, implementei:
 
 ```text
 src/workers/oracle_annotation_worker.py
 ```
 
-Esse worker representa a anotação simulada da atividade. Como os rótulos verdadeiros das imagens de stream já existem no BCCD, mas ficam separados até a etapa de anotação, o worker funciona como um oráculo digital.
+Esse worker representa a anotação simulada. Como os rótulos verdadeiros das imagens de stream já existem no BCCD, mas ficam separados até a etapa de anotação, o worker funciona como um oráculo digital.
 
 Ele consome mensagens de:
 
@@ -998,7 +1003,7 @@ Antes, depois que o worker reinjetava imagem e label em `data/raw`, eu ainda pre
 q.data.build
 ```
 
-Com o ajuste feito hoje, o `Oracle Annotation Worker` passou a publicar automaticamente um evento `data.build` com:
+Com o ajuste feito, o `Oracle Annotation Worker` passou a publicar automaticamente um evento `data.build` com:
 
 ```text
 trigger="feedback"
@@ -1049,7 +1054,7 @@ Published train event to q.train.run
 
 Isso confirmou que o dado anotado pelo oráculo entrou automaticamente no próximo ciclo do pipeline.
 
-Depois, fiz um ajuste importante no `Train Worker real`. A atividade pede que o treino faça fine-tune a partir do checkpoint vigente, e não sempre a partir do modelo inicial `v0`.
+Depois, fiz um ajuste importante no `Train Worker real`. O treino passou a fazer fine-tune a partir do checkpoint vigente, e não sempre a partir do modelo inicial `v0`.
 
 Antes, o treino usava o checkpoint inicial como base fixa. Ajustei a lógica para:
 
@@ -1067,7 +1072,7 @@ base_model_version=model-20260622-160102-df2d2e
 base_model_path=C:\dev\mlops-pipeline-challenge\storage\models\model-20260622-160102-df2d2e\best.pt
 ```
 
-Isso confirmou que o novo treino não partiu mais diretamente do `v0`, mas sim do modelo promovido vigente.
+Isso confirmou que o novo treino não partiu diretamente do `v0`, mas sim do modelo promovido vigente.
 
 O novo treino obteve:
 
@@ -1225,7 +1230,121 @@ Depois, disparei um novo build sem criar nenhuma nova anotação oracle. Nesse c
 
 Esse comportamento está correto, porque não houve nova anotação desde o último build.
 
-Também preparei a atualização do `README.md`, documentando o ciclo completo, os workers, as filas RabbitMQ, os comandos de reprodução, o healthcheck, a recuperação por `inference_id`, a rastreabilidade de datasets/modelos e as limitações atuais.
+Também criei scripts de demonstração guiada para facilitar a reprodução do projeto em outra máquina.
+
+Foram adicionados dois scripts:
+
+```text
+scripts/demo_pipeline.ps1
+scripts/demo_pipeline.sh
+```
+
+O primeiro é voltado para Windows PowerShell. O segundo é voltado para Linux/macOS.
+
+A ideia desses scripts é servir como alternativa a uma demonstração em vídeo, permitindo que outra pessoa execute uma demonstração rápida do fluxo principal diretamente no terminal.
+
+O modo principal é o `feedback`, que demonstra o seguinte ciclo:
+
+```text
+q.infer.result
+→ Collect Worker real
+→ q.label.task
+→ Oracle Annotation Worker
+→ data/raw recebe imagem + label anotados
+→ q.data.build automático com trigger="feedback"
+→ Data Worker real
+→ q.train.run
+```
+
+No script de Windows, os workers são abertos em janelas separadas de PowerShell. No script de Linux/macOS, os workers são iniciados em background e seus logs são salvos em:
+
+```text
+.demo_logs/
+```
+
+Essa diferença deixa a demonstração mais adequada a cada ambiente. No Windows, a abertura de janelas facilita acompanhar visualmente os workers. No Linux, rodar em background com logs é mais robusto, porque não depende do terminal gráfico instalado.
+
+Também adicionei o arquivo:
+
+```text
+.gitattributes
+```
+
+para garantir finais de linha adequados aos scripts:
+
+```text
+*.sh text eol=lf
+*.ps1 text eol=crlf
+```
+
+Com isso, o projeto passou a ter não apenas a documentação completa no README, mas também um caminho mais direto para executar uma demonstração reprodutível do loop de feedback.
+
+Depois de validar o script de demonstração, executei também o `Train Worker real` a partir do evento `q.train.run` gerado pelo Data Worker no loop de feedback.
+
+O evento consumido pelo Train Worker veio do dataset:
+
+```text
+ds-20260622-230918-d8f3ba
+```
+
+Esse dataset foi criado a partir de um evento:
+
+```text
+trigger="feedback"
+```
+
+e continha:
+
+```text
+train=67
+val=14
+test=14
+added_this_cycle=1
+```
+
+Isso confirmou que o treino foi disparado a partir de um dataset criado pelo ciclo automático de feedback.
+
+O Train Worker usou como checkpoint base o modelo vigente anterior:
+
+```text
+base_model=model-20260622-182157-34ab11
+```
+
+O novo treino obteve:
+
+```text
+TEST mAP50=0.8618
+Baseline mAP50=0.5000
+```
+
+Como a métrica ficou acima do baseline, o modelo passou no gate de qualidade, foi registrado em:
+
+```text
+storage/models/model-20260622-233122-64dae2
+```
+
+e o ponteiro de produção foi atualizado.
+
+Em seguida, validei o estado do modelo ativo com:
+
+```powershell
+uv run python src\tools\check_inference_status.py
+```
+
+O comando retornou:
+
+```text
+status=healthy
+model_version=model-20260622-233122-64dae2
+model_file_exists=true
+dataset_version=ds-20260622-230918-d8f3ba
+mAP50=0.8618
+baseline=0.5
+base_model=model-20260622-182157-34ab11
+production_pointer_exists=true
+```
+
+Essa validação fechou o ciclo completo: feedback, novo dataset, novo treino, gate de qualidade, promoção do modelo e atualização do modelo em produção.
 
 Os principais commits desta etapa foram:
 
@@ -1236,6 +1355,11 @@ Add oracle annotation worker
 Use current production checkpoint for training
 Add inference status and result lookup tools
 Track dataset metadata and added samples
+Trigger data build after oracle annotation
+Update documentation for automatic feedback loop
+Add guided demo script
+Add Linux guided demo script
+Normalize script line endings
 ```
 
 #### O que aprendi
@@ -1280,7 +1404,7 @@ A coleta identifica um caso útil ou incerto. A anotação simulada recupera o r
 
 Por isso, mantive a decisão de não deixar o `Collect Worker` publicar `q.data.build` diretamente. Uma inferência de baixa confiança ainda não significa que existe um novo dado pronto para treino; ela apenas indica que aquele exemplo deve virar uma tarefa de anotação.
 
-Com o ajuste feito hoje, o gatilho automático passou a acontecer no ponto correto do fluxo: o `Oracle Annotation Worker`.
+Com o ajuste feito, o gatilho automático passou a acontecer no ponto correto do fluxo: o `Oracle Annotation Worker`.
 
 Depois que ele consome uma tarefa em:
 
@@ -1313,6 +1437,10 @@ Também aprendi a importância de persistir resultados de inferência por `infer
 Além disso, aprendi que a rastreabilidade do dataset não depende apenas de salvar os arquivos de imagem e label. É importante registrar metadados do build, como a versão do dataset, a quantidade de imagens em cada split, o evento que originou o build e quantas novas amostras foram incorporadas naquele ciclo.
 
 O campo `added_this_cycle` ajudou a deixar explícito quando o dataset cresceu de fato por causa da anotação simulada.
+
+Também aprendi a importância de fornecer um caminho de reprodução simples para outra pessoa testar o projeto. O README explica o funcionamento completo, mas os scripts de demonstração reduzem o atrito para validar o fluxo principal.
+
+No Windows, faz sentido abrir os workers em janelas separadas, porque isso facilita acompanhar visualmente cada processo. No Linux/macOS, é mais robusto iniciar os workers em background e salvar logs em `.demo_logs/`, porque nem todo ambiente Linux possui o mesmo terminal gráfico.
 
 #### Decisões tomadas
 
@@ -1358,4 +1486,47 @@ Também decidi criar uma ferramenta simples de status da inferência, baseada no
 
 Por fim, decidi adicionar `metadata.json` nos datasets versionados e calcular `added_this_cycle` com base nas anotações oracle processadas. Isso melhorou a rastreabilidade entre anotação simulada, crescimento da fonte raw e criação de novos datasets.
 
-Com isso, considero que o projeto já demonstra o ciclo de MLOps de ponta a ponta, com workers independentes, comunicação por RabbitMQ, versionamento de dataset, treino com gate de qualidade, modelo em produção rastreável, inferência real, coleta de baixa confiança, anotação simulada, publicação automática de `q.data.build` após feedback e reincorporação dos dados ao ciclo.
+Também decidi criar dois scripts de demonstração guiada:
+
+```text
+scripts/demo_pipeline.ps1
+scripts/demo_pipeline.sh
+```
+
+A versão PowerShell atende ao ambiente Windows. A versão Bash atende Linux/macOS, que provavelmente é o ambiente mais comum para reprodução técnica do projeto.
+
+Também decidi que o modo principal dos scripts seria o `feedback`, porque ele demonstra o loop mais importante de forma rápida e segura, sem depender de rodar o treinamento completo ao vivo.
+
+---
+
+## 8. Conclusão final
+
+Ao final do desenvolvimento, o projeto demonstra um ciclo completo de MLOps orientado a mensagens para detecção de objetos.
+
+O pipeline contém workers independentes comunicando-se por RabbitMQ, contratos de mensagens com Pydantic, versionamento local de datasets e modelos, gate de qualidade para promoção, ponteiro operacional de produção, inferência real com ONNX, persistência de resultados por `inference_id`, coleta de baixa confiança, anotação simulada por oráculo e reincorporação automática dos dados ao ciclo.
+
+O fluxo final demonstrado é:
+
+```text
+q.data.build
+→ Data Worker real
+→ dataset versionado
+→ q.train.run
+→ Train Worker real
+→ gate de qualidade
+→ modelo promovido
+→ production.json
+→ q.infer.request
+→ Inference Worker real
+→ q.infer.result
+→ Collect Worker real
+→ q.label.task
+→ Oracle Annotation Worker
+→ data/raw cresce
+→ q.data.build automático com trigger="feedback"
+→ novo ciclo
+```
+
+Além da execução manual documentada no README, foram criados scripts de demonstração guiada para Windows e Linux/macOS, permitindo que o ciclo de feedback seja reproduzido de forma mais direta.
+
+Com isso, o projeto atende ao objetivo principal: transformar scripts isolados de dados, treino e inferência em um pipeline reprodutível, rastreável e demonstrável de ponta a ponta.
