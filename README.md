@@ -342,6 +342,10 @@ Exemplo:
 │   └── v0/
 │       └── best.pt
 │
+├── scripts/
+│   ├── demo_pipeline.ps1
+│   └── demo_pipeline.sh
+│
 ├── src/
 │   ├── contracts/
 │   │   └── messages.py
@@ -376,10 +380,12 @@ Exemplo:
 │   ├── label_candidates/
 │   └── oracle_annotations/
 │
+├── .gitattributes
 ├── docker-compose.yml
 ├── README.md
 └── relatorio.md
 ```
+
 
 ---
 
@@ -805,6 +811,97 @@ Get-ChildItem "$($latest.FullName)\images" -Recurse -Filter "oracle_*"
 Get-ChildItem "$($latest.FullName)\labels" -Recurse -Filter "oracle_*"
 ```
 
+### 9.12 Demo guiada por scripts
+
+Além da execução manual descrita acima, o projeto inclui scripts de demonstração guiada para facilitar a reprodução do fluxo principal em outra máquina.
+
+Existem duas versões:
+
+```text
+scripts/demo_pipeline.ps1   → Windows PowerShell
+scripts/demo_pipeline.sh    → Linux/macOS
+```
+
+#### Windows PowerShell
+
+Para rodar a demonstração rápida do loop de feedback no Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\demo_pipeline.ps1 -Mode feedback
+```
+
+#### Linux/macOS
+
+Para rodar a mesma demonstração no Linux ou macOS:
+
+```bash
+bash scripts/demo_pipeline.sh feedback
+```
+
+Opcionalmente, no Linux/macOS, também é possível tornar o script executável:
+
+```bash
+chmod +x scripts/demo_pipeline.sh
+./scripts/demo_pipeline.sh feedback
+```
+
+O modo `feedback` demonstra o seguinte fluxo:
+
+```text
+q.infer.result
+→ Collect Worker real
+→ q.label.task
+→ Oracle Annotation Worker
+→ data/raw recebe imagem + label anotados
+→ q.data.build automático com trigger="feedback"
+→ Data Worker real
+→ q.train.run
+```
+
+Durante a execução, os scripts:
+
+```text
+sobem o RabbitMQ com Docker Compose
+declaram as filas necessárias
+limpam as filas, salvo quando a opção de manter filas é usada
+iniciam os workers necessários
+publicam um resultado de inferência fake com baixa confiança
+verificam o estado das filas
+validam que o Oracle Annotation Worker publicou q.data.build automaticamente
+validam que o Data Worker consumiu q.data.build e publicou q.train.run
+```
+
+Resultado esperado antes do Data Worker consumir o build de feedback:
+
+```text
+q.infer.result  0
+q.label.task    0
+q.data.build    1
+```
+
+Resultado esperado depois do Data Worker:
+
+```text
+q.data.build    0
+q.train.run     1
+```
+
+No Linux/macOS, os workers são iniciados em background e os logs ficam salvos em:
+
+```text
+.demo_logs/
+```
+
+Exemplos:
+
+```bash
+cat .demo_logs/collect_worker_real.log
+cat .demo_logs/oracle_annotation_worker.log
+cat .demo_logs/data_worker_real.log
+```
+
+O modo `feedback` é o mais indicado para uma demonstração rápida e segura, porque valida o loop de coleta, anotação simulada e reconstrução de dataset sem depender de rodar o treinamento completo ao vivo.
+
 ---
 
 ## 10. Loop fechado demonstrado
@@ -1175,22 +1272,22 @@ fechar o loop de feedback para o próximo Data Worker
 
 ## 17. Limitações atuais
 
-O MVP já demonstra o loop fechado de ponta a ponta, mas ainda há pontos que podem ser evoluídos:
+O projeto já demonstra o loop fechado de ponta a ponta, mas ainda há pontos que podem ser evoluídos:
 
-1. Os workers são executados via `uv run` em terminais separados.
+1. Os workers são executados via `uv run` ou pelos scripts de demonstração, mas ainda não estão todos containerizados no `docker-compose.yml`.
 2. O `docker-compose.yml` sobe o RabbitMQ, mas a containerização completa dos workers ainda pode ser melhorada.
-3. A API REST de controle do pipeline não foi implementada, pois pertence à Fase 2 diferencial.
-4. O cálculo de `added_this_cycle` está baseado no log de anotações oracle do MVP.
-5. O rebuild após uma anotação simulada já é automático no MVP, mas em uma versão de produção o gatilho poderia ser em lote, por exemplo após N novas anotações, para evitar ciclos muito frequentes.
+3. A API REST de controle do pipeline não foi implementada; no estado atual, o controle é feito por scripts, workers e mensagens RabbitMQ.
+4. O cálculo de `added_this_cycle` está baseado no log de anotações oracle do projeto.
+5. O rebuild após uma anotação simulada já é automático, mas em uma versão mais robusta o gatilho poderia ser em lote, por exemplo após N novas anotações, para evitar ciclos muito frequentes.
 6. O gate de qualidade usa `mAP50` global; uma evolução seria incluir gate por classe.
 7. O Model Registry é implementado localmente em `storage/models`; uma versão futura poderia usar MLflow ou outro registry dedicado.
 8. O armazenamento é local; em produção, os URIs poderiam apontar para S3, GCS, MinIO ou outro storage de objetos.
 
 ---
 
-## 18. Próximos passos
+## 18. Possíveis evoluções
 
-Possíveis evoluções:
+Possíveis melhorias futuras:
 
 ```text
 containerizar todos os workers no docker-compose
@@ -1243,7 +1340,19 @@ uv run python src\tools\check_inference_status.py
 uv run python src\tools\get_inference_result.py --inference-id inf-da3eb216
 ```
 
-### Rodar workers reais
+### Rodar demo guiada no Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\demo_pipeline.ps1 -Mode feedback
+```
+
+### Rodar demo guiada no Linux/macOS
+
+```bash
+bash scripts/demo_pipeline.sh feedback
+```
+
+### Rodar workers reais manualmente
 
 ```powershell
 uv run python src\workers\data_worker_real.py
@@ -1255,7 +1364,7 @@ uv run python src\workers\oracle_annotation_worker.py
 
 ---
 
-## 20. Estado atual do MVP
+## 20. Estado atual do projeto
 
 O projeto já demonstra:
 
@@ -1268,6 +1377,7 @@ Train Worker real
 Inference Worker real
 Collect Worker real
 Oracle Annotation Worker
+scripts de demonstração guiada para Windows e Linux/macOS
 checkpoint vigente via production.json
 gate de qualidade
 modelo versionado
@@ -1281,4 +1391,4 @@ novo dataset contendo exemplo anotado
 loop fechado demonstrável
 ```
 
-O MVP está funcional para demonstrar o ciclo de MLOps proposto.
+O projeto está funcional para demonstrar o ciclo de MLOps proposto.
