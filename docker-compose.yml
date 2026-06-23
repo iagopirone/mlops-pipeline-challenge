@@ -6,7 +6,112 @@
       - "5672:5672"
       - "15672:15672"
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  data_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mlops-pipeline-workers:latest
+    container_name: mlops-data-worker
+    working_dir: /app
+    command: uv run python src/workers/data_worker_real.py
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./storage:/app/storage
+      - ./runs:/app/runs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  train_worker:
+    image: mlops-pipeline-workers:latest
+    container_name: mlops-train-worker
+    working_dir: /app
+    command: uv run python src/workers/train_worker_real.py
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./storage:/app/storage
+      - ./runs:/app/runs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      data_worker:
+        condition: service_started
+    restart: unless-stopped
+
+  infer_worker:
+    image: mlops-pipeline-workers:latest
+    container_name: mlops-infer-worker
+    working_dir: /app
+    command: uv run python src/workers/infer_worker_real.py
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./storage:/app/storage
+      - ./runs:/app/runs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  collect_worker:
+    image: mlops-pipeline-workers:latest
+    container_name: mlops-collect-worker
+    working_dir: /app
+    command: uv run python src/workers/collect_worker_real.py
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./storage:/app/storage
+      - ./runs:/app/runs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  oracle_annotation_worker:
+    image: mlops-pipeline-workers:latest
+    container_name: mlops-oracle-annotation-worker
+    working_dir: /app
+    command: uv run python src/workers/oracle_annotation_worker.py
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./storage:/app/storage
+      - ./runs:/app/runs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped

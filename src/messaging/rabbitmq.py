@@ -1,21 +1,38 @@
 import json
+import os
 from typing import Any
-
 import pika
 
 
-RABBITMQ_HOST = "localhost"
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
+RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
 
 
-def create_connection(host: str = RABBITMQ_HOST) -> pika.BlockingConnection:
+def create_connection(host: str | None = None) -> pika.BlockingConnection:
     """
     Creates a connection with RabbitMQ.
 
-    For now, RabbitMQ runs locally through Docker Compose.
+    Locally, the default host is localhost.
+    Inside Docker Compose, RABBITMQ_HOST should be set to the RabbitMQ service name.
     """
-    return pika.BlockingConnection(
-        pika.ConnectionParameters(host=host)
+    effective_host = host or RABBITMQ_HOST
+
+    credentials = pika.PlainCredentials(
+        username=RABBITMQ_USER,
+        password=RABBITMQ_PASSWORD,
     )
+
+    parameters = pika.ConnectionParameters(
+        host=effective_host,
+        port=RABBITMQ_PORT,
+        credentials=credentials,
+        heartbeat=600,
+        blocked_connection_timeout=300,
+    )
+
+    return pika.BlockingConnection(parameters)
 
 
 def declare_queues(
