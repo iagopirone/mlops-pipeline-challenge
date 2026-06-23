@@ -14,10 +14,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-# Treino offline (puxa torch via ultralytics) — necessário só para src/train.py
-train = [
-    "ultralytics>=8.3.0",
-]
+train = []
 
 [tool.uv]
 default-groups = []

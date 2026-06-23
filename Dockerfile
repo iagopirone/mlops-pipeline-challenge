@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY pyproject.toml uv.lock ./
 
-RUN uv sync --frozen
+RUN uv sync --frozen --no-group train
 
 COPY . .
 

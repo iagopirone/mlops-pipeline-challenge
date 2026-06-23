@@ -35,7 +35,10 @@
     restart: unless-stopped
 
   train_worker:
-    image: mlops-pipeline-workers:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.train
+    image: mlops-pipeline-train-worker:latest
     container_name: mlops-train-worker
     working_dir: /app
     command: uv run python src/workers/train_worker_real.py
@@ -52,8 +55,6 @@
     depends_on:
       rabbitmq:
         condition: service_healthy
-      data_worker:
-        condition: service_started
     restart: unless-stopped
 
   infer_worker:
