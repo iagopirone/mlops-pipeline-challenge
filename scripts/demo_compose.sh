@@ -1,4 +1,3 @@
-bash id="sfk7qt"
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -45,21 +44,30 @@ echo "[4/5] Publishing a low-confidence inference result to q.infer.result..."
 
 TMP_FILE="$(mktemp)"
 
+cleanup() {
+  rm -f "$TMP_FILE"
+}
+
+trap cleanup EXIT
+
 cat > "$TMP_FILE" <<'PY'
 import json
 from datetime import datetime, timezone
 
 import pika
 
+now = datetime.now(timezone.utc)
+timestamp = now.strftime("%Y%m%d%H%M%S")
+
 message = {
     "event": "infer.result",
-    "inference_id": "inf-compose-demo-low-conf",
+    "inference_id": f"inf-compose-demo-low-conf-{timestamp}",
     "model_version": "production",
     "status": "success",
     "image_uri": "data/stream/images/BloodImage_00000.jpg",
     "latency_ms": 35.5,
     "min_conf": 0.30,
-    "ts": datetime.now(timezone.utc).isoformat(),
+    "ts": now.isoformat(),
     "detections": [
         {
             "cls": "RBC",
@@ -112,7 +120,6 @@ print("Published low-confidence infer.result event to q.infer.result")
 PY
 
 uv run python "$TMP_FILE"
-rm -f "$TMP_FILE"
 
 echo
 echo "Waiting ${WAIT_SECONDS} seconds for workers to process the event..."
