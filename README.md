@@ -1311,16 +1311,23 @@ fechar o loop de feedback para o próximo Data Worker
 
 ## 17. Limitações atuais
 
-O projeto já demonstra o loop fechado de ponta a ponta, mas ainda há pontos que podem ser evoluídos:
+O projeto já demonstra o loop fechado de ponta a ponta, com RabbitMQ e todos os workers principais executando via Docker Compose. Ainda assim, há pontos que podem ser evoluídos:
 
-1. Os workers são executados via `uv run` ou pelos scripts de demonstração, mas ainda não estão todos containerizados no `docker-compose.yml`.
-2. O `docker-compose.yml` sobe o RabbitMQ, mas a containerização completa dos workers ainda pode ser melhorada.
-3. A API REST de controle do pipeline não foi implementada; no estado atual, o controle é feito por scripts, workers e mensagens RabbitMQ.
-4. O cálculo de `added_this_cycle` está baseado no log de anotações oracle do projeto.
+1. O controle do pipeline ainda é feito por scripts de demonstração e mensagens RabbitMQ; uma API REST de controle ainda não foi implementada.
+
+2. A demo é disparada por scripts externos, como `demo_compose.ps1` e `demo_compose.sh`, embora os serviços principais rodem em containers.
+
+3. O Oracle Annotation Worker simula a etapa de anotação; em uma versão real, essa etapa poderia ser integrada a uma ferramenta de rotulagem ou validação humana.
+
+4. O cálculo de `added_this_cycle` ainda é baseado no log local de anotações oracle do projeto.
+
 5. O rebuild após uma anotação simulada já é automático, mas em uma versão mais robusta o gatilho poderia ser em lote, por exemplo após N novas anotações, para evitar ciclos muito frequentes.
-6. O gate de qualidade usa `mAP50` global; uma evolução seria incluir gate por classe.
+
+6. O gate de qualidade usa `mAP50` global; uma evolução seria incluir métricas por classe.
+
 7. O Model Registry é implementado localmente em `storage/models`; uma versão futura poderia usar MLflow ou outro registry dedicado.
-8. O armazenamento é local; em produção, os URIs poderiam apontar para S3, GCS, MinIO ou outro storage de objetos.
+
+8. O armazenamento ainda é local; em produção, os URIs poderiam apontar para S3, GCS, MinIO ou outro storage de objetos.
 
 ---
 
@@ -1329,18 +1336,19 @@ O projeto já demonstra o loop fechado de ponta a ponta, mas ainda há pontos qu
 Possíveis melhorias futuras:
 
 ```text
-containerizar todos os workers no docker-compose
 criar uma API REST de controle do pipeline
+adicionar dashboard ou interface simples para acompanhar o estado do ciclo
 transformar o rebuild automático em gatilho por lote após N novas anotações
-adicionar gate por classe
+adicionar gate de qualidade por classe
 registrar métricas detalhadas por classe
 implementar rollback de modelo
 usar MLflow ou DVC para registry/versionamento
 usar storage de objetos em vez de arquivos locais
+integrar o Oracle a uma ferramenta real de anotação
 adicionar testes automatizados dos contratos de mensagens
+adicionar observabilidade com logs estruturados e métricas
 ```
 
----
 
 ## 19. Comandos úteis
 
